@@ -5,38 +5,70 @@ import { geminiService } from './services/geminiService';
 import MessageBubble from './components/MessageBubble';
 import InputBar from './components/InputBar';
 import VoiceOverlay from './components/VoiceOverlay';
+import Sidebar from './components/Sidebar';
 import { decode, decodeAudioData, createBlob } from './utils/audioUtils';
 import { LiveServerMessage } from '@google/genai';
 
 const App: React.FC = () => {
-  const [session, setSession] = useState<ChatSession>({
-    id: 'default',
-    title: 'New Session',
-    messages: [],
-    createdAt: new Date(),
+  const [sessions, setSessions] = useState<ChatSession[]>(() => {
+    const saved = localStorage.getItem('drona_sessions');
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        return parsed.map((s: any) => ({
+          ...s,
+          createdAt: new Date(s.createdAt),
+          messages: s.messages.map((m: any) => ({ ...m, timestamp: new Date(m.timestamp) }))
+        }));
+      } catch (e) {
+        return [];
+      }
+    }
+    return [];
   });
-  
-  // Voice State
+
+  const [activeSessionId, setActiveSessionId] = useState<string>(() => {
+    const lastActive = localStorage.getItem('drona_active_id');
+    return lastActive || '';
+  });
+
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isVoiceActive, setIsVoiceActive] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
 
-  // Audio Context References
+  // References
   const inputAudioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const sessionPromiseRef = useRef<Promise<any> | null>(null);
   const liveSessionRef = useRef<any>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   
-  // Transcription References
+  // Media references for Interaction Mode
+  const screenStreamRef = useRef<MediaStream | null>(null);
+  const audioStreamRef = useRef<MediaStream | null>(null);
+  const frameIntervalRef = useRef<number | null>(null);
+  const videoPreviewRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
   const currentInputTransRef = useRef('');
   const currentOutputTransRef = useRef('');
   const lastUserMsgIdRef = useRef<string | null>(null);
   const lastDronaMsgIdRef = useRef<string | null>(null);
 
-  const scrollRef = useRef<HTMLDivElement>(null);
+  // Persistence Effects
+  useEffect(() => {
+    localStorage.setItem('drona_sessions', JSON.stringify(sessions));
+  }, [sessions]);
+
+  useEffect(() => {
+    localStorage.setItem('drona_active_id', activeSessionId);
+  }, [activeSessionId]);
+
+  const activeSession = sessions.find(s => s.id === activeSessionId) || null;
 
   const scrollToBottom = useCallback(() => {
     if (scrollRef.current) {
@@ -46,7 +78,27 @@ const App: React.FC = () => {
 
   useEffect(() => {
     scrollToBottom();
-  }, [session.messages, scrollToBottom]);
+  }, [activeSession?.messages, scrollToBottom]);
+
+  const createNewSession = () => {
+    const newId = Date.now().toString();
+    const newSession: ChatSession = {
+      id: newId,
+      title: 'New Session',
+      messages: [],
+      createdAt: new Date(),
+    };
+    setSessions(prev => [newSession, ...prev]);
+    setActiveSessionId(newId);
+  };
+
+  const deleteSession = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setSessions(prev => prev.filter(s => s.id !== id));
+    if (activeSessionId === id) {
+      setActiveSessionId('');
+    }
+  };
 
   const stopAllAudio = () => {
     sourcesRef.current.forEach(source => {
@@ -56,24 +108,71 @@ const App: React.FC = () => {
     nextStartTimeRef.current = 0;
   };
 
-  const startVoiceMode = async () => {
+  const captureFrame = useCallback(() => {
+    if (!videoPreviewRef.current || !canvasRef.current || !sessionPromiseRef.current) return;
+
+    const video = videoPreviewRef.current;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Set canvas size to match video stream
+    canvas.width = video.videoWidth || 1280;
+    canvas.height = video.videoHeight || 720;
+    
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    
+    const base64Data = canvas.toDataURL('image/jpeg', 0.6).split(',')[1];
+    
+    sessionPromiseRef.current.then((session) => {
+      session.sendRealtimeInput({
+        media: { data: base64Data, mimeType: 'image/jpeg' }
+      });
+    });
+  }, []);
+
+  const startInteractionMode = async () => {
+    if (isVoiceActive) {
+      stopVoiceMode();
+      return;
+    }
+    
+    if (!activeSessionId) createNewSession();
     setIsVoiceActive(true);
     setIsLoading(true);
 
     try {
+      // 1. Get Screen Stream
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { cursor: "always" } as any,
+        audio: false
+      });
+      screenStreamRef.current = screenStream;
+
+      // 2. Setup video element for preview and capture
+      if (videoPreviewRef.current) {
+        videoPreviewRef.current.srcObject = screenStream;
+        videoPreviewRef.current.play();
+      }
+
+      if (!canvasRef.current) {
+        canvasRef.current = document.createElement('canvas');
+      }
+
+      // 3. Get Audio Stream
+      const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioStreamRef.current = audioStream;
+
       inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
       sessionPromiseRef.current = geminiService.connectLive({
         onopen: () => {
-          console.log('Live session opened');
           setIsLoading(false);
           
-          const source = inputAudioContextRef.current!.createMediaStreamSource(stream);
+          // Stream audio from the microphone
+          const source = inputAudioContextRef.current!.createMediaStreamSource(audioStream);
           const scriptProcessor = inputAudioContextRef.current!.createScriptProcessor(4096, 1, 1);
-          
           scriptProcessor.onaudioprocess = (e) => {
             const inputData = e.inputBuffer.getChannelData(0);
             const pcmBlob = createBlob(inputData);
@@ -81,34 +180,33 @@ const App: React.FC = () => {
               session.sendRealtimeInput({ media: pcmBlob });
             });
           };
-
           source.connect(scriptProcessor);
           scriptProcessor.connect(inputAudioContextRef.current!.destination);
+
+          // 4. Start 10s frame capture interval
+          captureFrame(); // Initial capture
+          frameIntervalRef.current = window.setInterval(captureFrame, 10000);
         },
         onmessage: async (message: LiveServerMessage) => {
-          // Handle Audio
+          // Handle Audio Output
           const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
           if (base64Audio && outputAudioContextRef.current) {
             setIsSpeaking(true);
             const ctx = outputAudioContextRef.current;
             nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-            
             const audioBuffer = await decodeAudioData(decode(base64Audio), ctx, 24000, 1);
             const source = ctx.createBufferSource();
             source.buffer = audioBuffer;
             source.connect(ctx.destination);
-            
             source.addEventListener('ended', () => {
               sourcesRef.current.delete(source);
               if (sourcesRef.current.size === 0) setIsSpeaking(false);
             });
-
             source.start(nextStartTimeRef.current);
             nextStartTimeRef.current += audioBuffer.duration;
             sourcesRef.current.add(source);
           }
 
-          // Handle Interruptions
           if (message.serverContent?.interrupted) {
             stopAllAudio();
             setIsSpeaking(false);
@@ -117,15 +215,13 @@ const App: React.FC = () => {
           // Handle Transcriptions
           if (message.serverContent?.inputTranscription) {
             setIsListening(true);
-            const text = message.serverContent.inputTranscription.text;
-            currentInputTransRef.current += text;
-            updateTranscriptions();
+            currentInputTransRef.current += message.serverContent.inputTranscription.text;
+            syncVoiceTranscriptionToMessages();
           }
 
           if (message.serverContent?.outputTranscription) {
-            const text = message.serverContent.outputTranscription.text;
-            currentOutputTransRef.current += text;
-            updateTranscriptions();
+            currentOutputTransRef.current += message.serverContent.outputTranscription.text;
+            syncVoiceTranscriptionToMessages();
           }
 
           if (message.serverContent?.turnComplete) {
@@ -136,68 +232,59 @@ const App: React.FC = () => {
             lastDronaMsgIdRef.current = null;
           }
         },
-        onerror: (e) => {
-          console.error('Live Error:', e);
-          stopVoiceMode();
+        onerror: (e) => { 
+          console.error("Live Error", e);
+          stopVoiceMode(); 
         },
-        onclose: () => {
-          console.log('Live connection closed');
-          stopVoiceMode();
+        onclose: () => { 
+          console.log("Live Closed");
+          stopVoiceMode(); 
         }
       });
 
-      sessionPromiseRef.current.then(session => {
-        liveSessionRef.current = session;
-      });
+      sessionPromiseRef.current.then(session => { liveSessionRef.current = session; });
+      
+      // Stop interaction mode if screenshare is stopped manually by user via browser bar
+      screenStream.getVideoTracks()[0].onended = () => {
+        stopVoiceMode();
+      };
 
     } catch (err) {
-      console.error('Failed to start voice mode:', err);
+      console.error("Failed to start interaction mode", err);
       setIsVoiceActive(false);
       setIsLoading(false);
     }
   };
 
-  const updateTranscriptions = () => {
-    setSession(prev => {
-      let newMessages = [...prev.messages];
-
-      // Update User Transcription
+  const syncVoiceTranscriptionToMessages = () => {
+    setSessions(prev => prev.map(s => {
+      if (s.id !== activeSessionId) return s;
+      
+      let newMessages = [...s.messages];
+      
       if (currentInputTransRef.current) {
         if (!lastUserMsgIdRef.current) {
-          lastUserMsgIdRef.current = Date.now().toString() + '-user';
-          newMessages.push({
-            id: lastUserMsgIdRef.current,
-            role: Role.USER,
-            content: currentInputTransRef.current,
-            timestamp: new Date()
-          });
+          lastUserMsgIdRef.current = Date.now().toString() + '-voice-u';
+          newMessages.push({ id: lastUserMsgIdRef.current, role: Role.USER, content: currentInputTransRef.current, timestamp: new Date() });
         } else {
-          newMessages = newMessages.map(m => 
-            m.id === lastUserMsgIdRef.current ? { ...m, content: currentInputTransRef.current } : m
-          );
+          newMessages = newMessages.map(m => m.id === lastUserMsgIdRef.current ? { ...m, content: currentInputTransRef.current } : m);
         }
       }
 
-      // Update Drona Transcription
       if (currentOutputTransRef.current) {
         if (!lastDronaMsgIdRef.current) {
-          lastDronaMsgIdRef.current = Date.now().toString() + '-drona';
-          newMessages.push({
-            id: lastDronaMsgIdRef.current,
-            role: Role.DRONA,
-            content: currentOutputTransRef.current,
-            timestamp: new Date(),
-            isStreaming: true
-          });
+          lastDronaMsgIdRef.current = Date.now().toString() + '-voice-d';
+          newMessages.push({ id: lastDronaMsgIdRef.current, role: Role.DRONA, content: currentOutputTransRef.current, timestamp: new Date(), isStreaming: true });
         } else {
-          newMessages = newMessages.map(m => 
-            m.id === lastDronaMsgIdRef.current ? { ...m, content: currentOutputTransRef.current } : m
-          );
+          newMessages = newMessages.map(m => m.id === lastDronaMsgIdRef.current ? { ...m, content: currentOutputTransRef.current } : m);
         }
       }
 
-      return { ...prev, messages: newMessages };
-    });
+      const firstMsg = newMessages.find(m => m.role === Role.USER)?.content || s.title;
+      const title = firstMsg.slice(0, 30) + (firstMsg.length > 30 ? '...' : '');
+
+      return { ...s, messages: newMessages, title };
+    }));
   };
 
   const stopVoiceMode = () => {
@@ -205,80 +292,96 @@ const App: React.FC = () => {
     setIsSpeaking(false);
     setIsListening(false);
     stopAllAudio();
-    if (liveSessionRef.current) {
-      try { liveSessionRef.current.close(); } catch (e) {}
-      liveSessionRef.current = null;
+    
+    // Clear interval
+    if (frameIntervalRef.current) {
+      clearInterval(frameIntervalRef.current);
+      frameIntervalRef.current = null;
     }
-    if (inputAudioContextRef.current) {
-      inputAudioContextRef.current.close();
-      inputAudioContextRef.current = null;
+    
+    // Stop streams
+    if (screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach(track => track.stop());
+      screenStreamRef.current = null;
     }
-    if (outputAudioContextRef.current) {
-      outputAudioContextRef.current.close();
-      outputAudioContextRef.current = null;
+    if (audioStreamRef.current) {
+      audioStreamRef.current.getTracks().forEach(track => track.stop());
+      audioStreamRef.current = null;
     }
+    
+    if (videoPreviewRef.current) {
+      videoPreviewRef.current.pause();
+      videoPreviewRef.current.srcObject = null;
+    }
+
+    if (liveSessionRef.current) { 
+      try { liveSessionRef.current.close(); } catch(e){} 
+      liveSessionRef.current = null; 
+    }
+    if (inputAudioContextRef.current) { inputAudioContextRef.current.close(); inputAudioContextRef.current = null; }
+    if (outputAudioContextRef.current) { outputAudioContextRef.current.close(); outputAudioContextRef.current = null; }
   };
 
   const handleSend = async (text: string) => {
-    const userMessage: Message = {
-      id: Date.now().toString(),
-      role: Role.USER,
-      content: text,
-      timestamp: new Date(),
-    };
+    let currentId = activeSessionId;
+    if (!currentId) {
+      const newId = Date.now().toString();
+      currentId = newId;
+      const newSession: ChatSession = {
+        id: newId,
+        title: text.slice(0, 30) + (text.length > 30 ? '...' : ''),
+        messages: [],
+        createdAt: new Date(),
+      };
+      setSessions(prev => [newSession, ...prev]);
+      setActiveSessionId(newId);
+    }
 
-    const dronaMessageId = (Date.now() + 1).toString();
-    const initialDronaMessage: Message = {
-      id: dronaMessageId,
-      role: Role.DRONA,
-      content: '',
-      timestamp: new Date(),
-      isStreaming: true,
-    };
+    const userMsg: Message = { id: Date.now().toString(), role: Role.USER, content: text, timestamp: new Date() };
+    const dronaId = (Date.now() + 1).toString();
+    const dronaMsg: Message = { id: dronaId, role: Role.DRONA, content: '', timestamp: new Date(), isStreaming: true };
 
-    setSession(prev => ({
-      ...prev,
-      messages: [...prev.messages, userMessage, initialDronaMessage]
+    setSessions(prev => prev.map(s => {
+      if (s.id === currentId) {
+        const title = s.messages.length === 0 ? text.slice(0, 30) + (text.length > 30 ? '...' : '') : s.title;
+        return { ...s, messages: [...s.messages, userMsg, dronaMsg], title };
+      }
+      return s;
     }));
 
     setIsLoading(true);
-
     try {
-      const history = session.messages.map(m => ({
+      const history = (activeSession?.messages || []).map(m => ({
         role: m.role === Role.USER ? 'user' : 'model',
         parts: [{ text: m.content }]
       }));
 
       const stream = geminiService.streamChat(history, text);
-      let accumulatedText = '';
-
+      let accumulated = '';
       for await (const chunk of stream) {
-        accumulatedText += chunk;
-        setSession(prev => ({
-          ...prev,
-          messages: prev.messages.map(m => 
-            m.id === dronaMessageId 
-              ? { ...m, content: accumulatedText } 
-              : m
-          )
+        accumulated += chunk;
+        setSessions(prev => prev.map(s => {
+          if (s.id === currentId) {
+            return { ...s, messages: s.messages.map(m => m.id === dronaId ? { ...m, content: accumulated } : m) };
+          }
+          return s;
         }));
       }
-
-      setSession(prev => ({
-        ...prev,
-        messages: prev.messages.map(m => 
-          m.id === dronaMessageId ? { ...m, isStreaming: false } : m
-        )
+      setSessions(prev => prev.map(s => {
+        if (s.id === currentId) {
+          return { ...s, messages: s.messages.map(m => m.id === dronaId ? { ...m, isStreaming: false } : m) };
+        }
+        return s;
       }));
     } catch (error) {
-      console.error('Error in chat:', error);
+      console.error(error);
     } finally {
       setIsLoading(false);
     }
   };
 
   return (
-    <div className="flex flex-col h-screen bg-slate-950 text-slate-200 overflow-hidden">
+    <div className="flex h-screen bg-slate-950 text-slate-200 overflow-hidden">
       <VoiceOverlay 
         isActive={isVoiceActive} 
         isSpeaking={isSpeaking} 
@@ -286,75 +389,129 @@ const App: React.FC = () => {
         onClose={stopVoiceMode}
       />
 
-      {/* Header */}
-      <header className="flex items-center justify-between px-6 py-4 bg-slate-900/50 backdrop-blur-xl border-b border-slate-800 z-10">
-        <div className="flex items-center gap-3">
-          <div className="p-2 bg-indigo-600 rounded-lg shadow-lg shadow-indigo-500/20">
-            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path>
-            </svg>
-          </div>
-          <div>
-            <h1 className="text-xl font-bold tracking-tight text-white serif italic">Drona</h1>
-            <p className="text-[10px] text-slate-400 font-medium uppercase tracking-widest">Master AI Mentor</p>
-          </div>
-        </div>
-        
-        <div className="flex items-center gap-2">
-          <button 
-            onClick={startVoiceMode}
-            className={`p-2.5 rounded-full transition-all ${isVoiceActive ? 'bg-indigo-600 text-white animate-pulse' : 'bg-slate-800 text-slate-400 hover:text-white'}`}
-            title="Start Voice Session"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-              <line x1="12" y1="19" x2="12" y2="23"></line>
-              <line x1="8" y1="23" x2="16" y2="23"></line>
-            </svg>
-          </button>
-          
-          <button 
-            onClick={() => setSession({ id: Date.now().toString(), title: 'New Session', messages: [], createdAt: new Date() })}
-            className="text-slate-400 hover:text-white transition-colors p-2.5 rounded-full hover:bg-slate-800"
-            title="New Chat"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
-              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
-            </svg>
-          </button>
-        </div>
-      </header>
+      <Sidebar 
+        sessions={sessions}
+        activeSessionId={activeSessionId}
+        onSelectSession={setActiveSessionId}
+        onNewChat={createNewSession}
+        onDeleteSession={deleteSession}
+        isOpen={isSidebarOpen}
+        onToggle={() => setIsSidebarOpen(!isSidebarOpen)}
+      />
 
-      {/* Main Chat Area */}
-      <main className="flex-1 overflow-y-auto px-4 py-8 relative" ref={scrollRef}>
-        <div className="max-w-4xl mx-auto min-h-full flex flex-col">
-          {session.messages.length === 0 ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-center space-y-8 animate-in fade-in zoom-in duration-700">
-              <div className="relative">
-                <div className="absolute inset-0 bg-indigo-500 blur-3xl opacity-10 rounded-full animate-pulse"></div>
-                <div className="w-24 h-24 bg-gradient-to-br from-indigo-500 to-emerald-500 rounded-3xl flex items-center justify-center shadow-2xl transform rotate-12 transition-transform hover:rotate-0 cursor-pointer">
-                  <span className="text-4xl font-bold text-white serif italic">D</span>
-                </div>
+      <div className="flex-1 flex flex-col relative min-w-0">
+        {/* Header */}
+        <header className="flex items-center justify-between px-6 py-4 bg-slate-900/50 backdrop-blur-xl border-b border-slate-800 z-10">
+          <div className="flex items-center gap-4">
+            <button 
+              onClick={() => setIsSidebarOpen(true)}
+              className="md:hidden text-slate-400 hover:text-white"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="3" y1="12" x2="21" y2="12"></line>
+                <line x1="3" y1="6" x2="21" y2="6"></line>
+                <line x1="3" y1="18" x2="21" y2="18"></line>
+              </svg>
+            </button>
+            <div className="hidden sm:flex items-center gap-3">
+              <div className="p-2 bg-indigo-600 rounded-lg shadow-lg">
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path>
+                </svg>
               </div>
-              <div className="max-w-md">
-                <h2 className="text-3xl font-bold text-white serif mb-3 italic">Welcome, Seeker.</h2>
-                <p className="text-slate-400 leading-relaxed">
-                  I am Drona, your intelligent mentor. Ask me via text or click the microphone to speak with me directly.
-                </p>
+              <div className="leading-tight">
+                <h1 className="text-lg font-bold text-white serif italic">Drona</h1>
+                <p className="text-[9px] text-slate-500 font-bold uppercase tracking-widest">Master Mentor</p>
               </div>
             </div>
-          ) : (
-            session.messages.map((msg) => (
-              <MessageBubble key={msg.id} message={msg} />
-            ))
+          </div>
+          
+          <div className="flex items-center gap-3">
+            <button 
+              className="px-4 py-2 text-sm font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-all shadow-md shadow-indigo-500/20"
+              onClick={() => alert('Signup/Login functionality is not implemented yet.')}
+            >
+              Login / Sign Up
+            </button>
+          </div>
+        </header>
+
+        {/* Main Content Area Split */}
+        <div className="flex-1 flex overflow-hidden">
+          {/* Main Chat Area */}
+          <main className="flex-1 overflow-y-auto px-4 py-8 relative" ref={scrollRef}>
+            <div className="max-w-4xl mx-auto min-h-full flex flex-col">
+              {!activeSession || activeSession.messages.length === 0 ? (
+                <div className="flex-1 flex flex-col items-center justify-center text-center space-y-8 animate-in fade-in zoom-in duration-700">
+                  <div className="relative">
+                    <div className="absolute inset-0 bg-indigo-500 blur-3xl opacity-10 rounded-full animate-pulse"></div>
+                    <div className="w-20 h-20 bg-gradient-to-br from-indigo-500 to-emerald-500 rounded-2xl flex items-center justify-center shadow-2xl transform rotate-12">
+                      <span className="text-3xl font-bold text-white serif italic">D</span>
+                    </div>
+                  </div>
+                  <div className="max-w-md px-6">
+                    <h2 className="text-2xl font-bold text-white serif mb-3 italic">Welcome to the Arena of Wisdom</h2>
+                    <p className="text-slate-400 leading-relaxed text-sm">
+                      I am Drona, your master AI mentor. Start a conversation or hit the **Interaction Mode** button to begin your real-time mentorship session with screen and voice.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                activeSession.messages.map((msg) => (
+                  <MessageBubble key={msg.id} message={msg} />
+                ))
+              )}
+            </div>
+          </main>
+
+          {/* Screen Share Preview Panel */}
+          {isVoiceActive && (
+            <aside className="hidden lg:flex flex-col w-96 border-l border-slate-800 bg-slate-900/30 p-4 animate-in slide-in-from-right duration-500">
+              <div className="flex flex-col h-full">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-2">
+                    <div className="w-2 h-2 rounded-full bg-amber-500 animate-pulse"></div>
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Live Preview</span>
+                  </div>
+                  <button 
+                    onClick={stopVoiceMode}
+                    className="p-1 text-slate-500 hover:text-white transition-colors"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="18" y1="6" x2="6" y2="18"></line>
+                      <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+                  </button>
+                </div>
+                
+                <div className="flex-1 flex items-center justify-center bg-slate-800/50 rounded-2xl overflow-hidden border border-slate-700 shadow-2xl relative group">
+                  <video 
+                    ref={videoPreviewRef} 
+                    className="max-w-full max-h-full object-contain"
+                    autoPlay 
+                    muted 
+                    playsInline 
+                  />
+                  <div className="absolute inset-0 bg-indigo-500/5 pointer-events-none group-hover:bg-transparent transition-all"></div>
+                </div>
+
+                <div className="mt-4 p-4 bg-slate-800/30 rounded-xl border border-slate-700/50">
+                  <p className="text-[11px] text-slate-500 leading-relaxed">
+                    Drona is currently observing your screen to provide real-time mentorship based on your activity. Frames are captured periodically.
+                  </p>
+                </div>
+              </div>
+            </aside>
           )}
         </div>
-      </main>
 
-      {/* Input Bar */}
-      <InputBar onSend={handleSend} disabled={isLoading} />
+        <InputBar 
+          onSend={handleSend} 
+          onVoiceClick={startInteractionMode} 
+          isVoiceActive={isVoiceActive} 
+          disabled={isLoading} 
+        />
+      </div>
     </div>
   );
 };

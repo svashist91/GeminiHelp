@@ -1,7 +1,7 @@
 
 import { GoogleGenAI, GenerateContentResponse, Modality, LiveServerMessage } from "@google/genai";
 
-const API_KEY = process.env.API_KEY || '';
+// Removed the intermediate API_KEY constant to comply with the strict guideline of using process.env.API_KEY directly.
 
 export class GeminiService {
   private ai: GoogleGenAI;
@@ -9,7 +9,8 @@ export class GeminiService {
   private liveModelName = 'gemini-2.5-flash-native-audio-preview-09-2025';
 
   constructor() {
-    this.ai = new GoogleGenAI({ apiKey: API_KEY });
+    // ALWAYS use process.env.API_KEY directly when initializing the client as per guidelines.
+    this.ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   }
 
   async *streamChat(history: { role: string; parts: { text: string }[] }[], prompt: string) {
@@ -27,6 +28,7 @@ export class GeminiService {
     
     for await (const chunk of result) {
       const response = chunk as GenerateContentResponse;
+      // Using .text property instead of .text() method as per guidelines.
       yield response.text || '';
     }
   }
@@ -37,20 +39,21 @@ export class GeminiService {
     onerror: (e: ErrorEvent) => void;
     onclose: (e: CloseEvent) => void;
   }) {
-    // Re-instantiate to ensure fresh API key if needed
-    const liveAi = new GoogleGenAI({ apiKey: API_KEY });
+    // ALWAYS use process.env.API_KEY directly when initializing the client for each connection.
+    const liveAi = new GoogleGenAI({ apiKey: process.env.API_KEY });
     return liveAi.live.connect({
       model: this.liveModelName,
       callbacks,
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } },
         },
         inputAudioTranscription: {},
         outputAudioTranscription: {},
-        systemInstruction: `You are Drona, a wise and patient AI mentor. You are engaging in a real-time voice conversation. 
-        Keep your responses concise but insightful, suitable for voice interaction. 
+        systemInstruction: `You are Drona, a wise and patient AI mentor. You are engaging in a real-time voice and vision conversation. 
+        You can see the user's screen through periodic snapshots and hear their voice. 
+        Keep your responses concise but insightful. Use what you see on the screen to provide context-aware guidance. 
         Be encouraging and helpful. If you don't know something, admit it gracefully.`,
       },
     });
