@@ -1,25 +1,36 @@
 
 import { GoogleGenAI, GenerateContentResponse, Modality, LiveServerMessage } from "@google/genai";
 
-// Removed the intermediate API_KEY constant to comply with the strict guideline of using process.env.API_KEY directly.
-
 export class GeminiService {
   private ai: GoogleGenAI;
   private modelName = 'gemini-3-pro-preview';
   private liveModelName = 'gemini-2.5-flash-native-audio-preview-09-2025';
 
   constructor() {
-    // ALWAYS use process.env.API_KEY directly when initializing the client as per guidelines.
     this.ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  }
+
+  private getSystemInstruction(isLive: boolean = false) {
+    const now = new Date();
+    const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+    const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+    
+    const base = `You are Drona, a wise, patient, and highly intelligent AI mentor. 
+    Your goal is to guide students and seekers through complex topics with clarity and depth. 
+    Adopt a calm, authoritative yet encouraging tone. 
+    IMPORTANT: Current Date is ${dateStr} and Current Time is ${timeStr}. Use this information to answer any questions about the current date, time, or for performing calculations involving time.`;
+
+    if (isLive) {
+      return `${base} You are engaging in "Interaction Mode" (real-time voice and vision). You can see the user's shared screen and hear their voice. Use the visual information from the screen to provide context-aware mentorship. Keep your responses concise but insightful.`;
+    }
+    return `${base} Respond in Markdown format.`;
   }
 
   async *streamChat(history: { role: string; parts: { text: string }[] }[], prompt: string) {
     const chat = this.ai.chats.create({
       model: this.modelName,
       config: {
-        systemInstruction: `You are Drona, a wise, patient, and highly intelligent AI mentor. 
-        Your goal is to guide students and seekers through complex topics with clarity and depth. 
-        Adopt a calm, authoritative yet encouraging tone. Respond in Markdown format.`,
+        systemInstruction: this.getSystemInstruction(),
         temperature: 0.7,
       }
     });
@@ -28,7 +39,6 @@ export class GeminiService {
     
     for await (const chunk of result) {
       const response = chunk as GenerateContentResponse;
-      // Using .text property instead of .text() method as per guidelines.
       yield response.text || '';
     }
   }
@@ -39,7 +49,6 @@ export class GeminiService {
     onerror: (e: ErrorEvent) => void;
     onclose: (e: CloseEvent) => void;
   }) {
-    // ALWAYS use process.env.API_KEY directly when initializing the client for each connection.
     const liveAi = new GoogleGenAI({ apiKey: process.env.API_KEY });
     return liveAi.live.connect({
       model: this.liveModelName,
@@ -47,14 +56,11 @@ export class GeminiService {
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } },
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
         },
         inputAudioTranscription: {},
         outputAudioTranscription: {},
-        systemInstruction: `You are Drona, a wise and patient AI mentor. You are engaging in a real-time voice and vision conversation. 
-        You can see the user's screen through periodic snapshots and hear their voice. 
-        Keep your responses concise but insightful. Use what you see on the screen to provide context-aware guidance. 
-        Be encouraging and helpful. If you don't know something, admit it gracefully.`,
+        systemInstruction: this.getSystemInstruction(true),
       },
     });
   }

@@ -35,32 +35,24 @@ const InputBar: React.FC<InputBarProps> = ({ onSend, onVoiceClick, isVoiceActive
   }, [input]);
 
   return (
-    <div className="border-t border-slate-800 bg-slate-900/80 backdrop-blur-md p-4 pb-8">
+    <div className="border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/80 backdrop-blur-md p-4 pb-8">
       <form onSubmit={handleSubmit} className="max-w-4xl mx-auto flex items-end gap-3">
-        {/* Interaction Mode Button (Screen + Voice) */}
         <button
           type="button"
           onClick={onVoiceClick}
           className={`p-3 rounded-xl transition-all shadow-lg flex-shrink-0 ${
             isVoiceActive 
-              ? 'bg-amber-500 text-white animate-pulse' 
-              : 'bg-slate-800 text-slate-400 hover:text-white hover:bg-slate-700'
+              ? 'bg-red-500 text-white animate-pulse' 
+              : 'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700'
           }`}
-          title={isVoiceActive ? "Stop Interaction Mode" : "Start Interaction Mode (Screen + Voice)"}
+          title={isVoiceActive ? "Stop Interaction Mode" : "Start Interaction Mode (Voice + Vision)"}
         >
-          {isVoiceActive ? (
-            <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-               <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
-               <circle cx="12" cy="12" r="3"></circle>
-            </svg>
-          ) : (
-            <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
-              <line x1="8" y1="21" x2="16" y2="21"></line>
-              <line x1="12" y1="17" x2="12" y2="21"></line>
-              <circle cx="12" cy="10" r="3"></circle>
-            </svg>
-          )}
+          <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+            <line x1="8" y1="21" x2="16" y2="21"></line>
+            <line x1="12" y1="17" x2="12" y2="21"></line>
+            <circle cx="12" cy="10" r="3"></circle>
+          </svg>
         </button>
 
         <div className="flex-1 relative">
@@ -72,14 +64,14 @@ const InputBar: React.FC<InputBarProps> = ({ onSend, onVoiceClick, isVoiceActive
             onKeyDown={handleKeyDown}
             placeholder="Ask Drona anything..."
             disabled={disabled}
-            className="w-full bg-slate-800 text-slate-200 border border-slate-700 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all resize-none disabled:opacity-50"
+            className="w-full bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-slate-200 border border-slate-200 dark:border-slate-700 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all resize-none disabled:opacity-50"
           />
         </div>
         
         <button
           type="submit"
           disabled={!input.trim() || disabled}
-          className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-700 disabled:cursor-not-allowed text-white p-3 rounded-xl transition-colors shadow-lg flex-shrink-0"
+          className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 dark:disabled:bg-slate-700 disabled:cursor-not-allowed text-white p-3 rounded-xl transition-colors shadow-lg flex-shrink-0"
         >
           <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <line x1="22" y1="2" x2="11" y2="13"></line>
@@ -87,7 +79,7 @@ const InputBar: React.FC<InputBarProps> = ({ onSend, onVoiceClick, isVoiceActive
           </svg>
         </button>
       </form>
-      <p className="text-[10px] text-slate-500 text-center mt-3 uppercase tracking-widest font-medium">
+      <p className="text-[10px] text-slate-500 dark:text-slate-500 text-center mt-3 uppercase tracking-widest font-medium">
         Driven by Intelligence • Built for Wisdom
       </p>
     </div>

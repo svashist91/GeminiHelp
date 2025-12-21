@@ -36,10 +36,10 @@ const VoiceOverlay: React.FC<VoiceOverlayProps> = ({ isActive, isSpeaking, isLis
 
       <div className="mt-12 text-center">
         <h2 className="text-2xl font-bold text-white serif mb-2 italic">
-          {isSpeaking ? 'Drona is speaking...' : isListening ? 'Listening to you...' : 'Connection established'}
+          {isSpeaking ? 'Drona is speaking...' : isListening ? 'Observing & Listening...' : 'Interaction Active'}
         </h2>
         <p className="text-slate-400 font-medium tracking-widest uppercase text-xs">
-          Real-time Mentorship Active
+          Live Screen & Audio Mentorship
         </p>
       </div>
 

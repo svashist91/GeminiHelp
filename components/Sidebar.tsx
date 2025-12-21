@@ -23,7 +23,6 @@ const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   return (
     <>
-      {/* Mobile Overlay */}
       {isOpen && (
         <div 
           className="fixed inset-0 bg-black/50 z-20 md:hidden backdrop-blur-sm"
@@ -31,10 +30,8 @@ const Sidebar: React.FC<SidebarProps> = ({
         />
       )}
 
-      {/* Sidebar Container */}
-      <aside className={`fixed md:relative inset-y-0 left-0 z-30 w-72 bg-slate-900 border-r border-slate-800 flex flex-col transition-transform duration-300 transform ${isOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
+      <aside className={`fixed md:relative inset-y-0 left-0 z-30 w-72 bg-slate-50 dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 flex flex-col transition-transform duration-300 transform ${isOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
         <div className="p-4 flex flex-col h-full">
-          {/* New Chat Button */}
           <button
             onClick={() => {
               onNewChat();
@@ -49,16 +46,14 @@ const Sidebar: React.FC<SidebarProps> = ({
             New Chat
           </button>
 
-          {/* History Label */}
-          <div className="text-[10px] uppercase tracking-[0.2em] text-slate-500 font-bold mb-3 px-2">
+          <div className="text-[10px] uppercase tracking-[0.2em] text-slate-500 dark:text-slate-500 font-bold mb-3 px-2">
             Recent Mentorships
           </div>
 
-          {/* Sessions List */}
           <div className="flex-1 overflow-y-auto space-y-1 pr-2 -mr-2">
             {sessions.length === 0 ? (
               <div className="text-center py-8 px-4">
-                <p className="text-slate-600 text-sm italic">No history yet</p>
+                <p className="text-slate-400 text-sm italic">No history yet</p>
               </div>
             ) : (
               sessions.map((s) => (
@@ -70,8 +65,8 @@ const Sidebar: React.FC<SidebarProps> = ({
                   }}
                   className={`group flex items-center justify-between p-3 rounded-xl cursor-pointer transition-all ${
                     activeSessionId === s.id 
-                      ? 'bg-slate-800 text-white border border-slate-700' 
-                      : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'
+                      ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white border border-slate-200 dark:border-slate-700 shadow-sm' 
+                      : 'text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/50 hover:text-slate-900 dark:hover:text-slate-200'
                   }`}
                 >
                   <div className="flex items-center gap-3 overflow-hidden">
@@ -85,7 +80,7 @@ const Sidebar: React.FC<SidebarProps> = ({
                   
                   <button
                     onClick={(e) => onDeleteSession(s.id, e)}
-                    className="opacity-0 group-hover:opacity-100 p-1 hover:text-red-400 transition-all rounded"
+                    className="opacity-0 group-hover:opacity-100 p-1 hover:text-red-500 transition-all rounded"
                     title="Delete session"
                   >
                     <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -98,11 +93,10 @@ const Sidebar: React.FC<SidebarProps> = ({
             )}
           </div>
 
-          {/* Footer Info */}
-          <div className="pt-4 border-t border-slate-800 mt-4 px-2">
+          <div className="pt-4 border-t border-slate-200 dark:border-slate-800 mt-4 px-2">
              <div className="flex items-center gap-3 opacity-60">
                <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
-               <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Drona v1.0.2</span>
+               <span className="text-[10px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-widest">Drona v1.1.0</span>
              </div>
           </div>
         </div>
