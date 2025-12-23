@@ -1,12 +1,12 @@
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Message, Role, ChatSession } from './types';
-import { geminiService } from './services/geminiService';
-import MessageBubble from './components/MessageBubble';
-import InputBar from './components/InputBar';
-import VoiceOverlay from './components/VoiceOverlay';
-import Sidebar from './components/Sidebar';
-import { decode, decodeAudioData, createBlob } from './utils/audioUtils';
+import { Message, Role, ChatSession } from '../types';
+import { geminiService } from '../services/geminiService';
+import MessageBubble from '../components/MessageBubble';
+import InputBar from '../components/InputBar';
+import VoiceOverlay from '../components/VoiceOverlay';
+import Sidebar from '../components/Sidebar';
+import { decode, decodeAudioData, createBlob } from '../utils/audioUtils';
 import { LiveServerMessage } from '@google/genai';
 
 const App: React.FC = () => {

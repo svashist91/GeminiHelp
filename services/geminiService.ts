@@ -7,7 +7,7 @@ export class GeminiService {
   private liveModelName = 'gemini-2.5-flash-native-audio-preview-09-2025';
 
   constructor() {
-    this.ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    this.ai = new GoogleGenAI({ apiKey: (import.meta as any).env.VITE_GOOGLE_API_KEY });
   }
 
   private getSystemInstruction(isLive: boolean = false) {
@@ -49,7 +49,7 @@ export class GeminiService {
     onerror: (e: ErrorEvent) => void;
     onclose: (e: CloseEvent) => void;
   }) {
-    const liveAi = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    const liveAi = new GoogleGenAI({ apiKey: (import.meta as any).env.VITE_GOOGLE_API_KEY });
     return liveAi.live.connect({
       model: this.liveModelName,
       callbacks,
