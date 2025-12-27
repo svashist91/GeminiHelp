@@ -1,9 +1,8 @@
 {
   "name": "Drona - AI Mentor",
-  "description": "An intelligent AI application that acts as a wise mentor, answering questions with clarity and depth using the power of Gemini.",
+  "description": "...",
   "requestFramePermissions": [
     "microphone",
-    "camera",
-    "display-capture"
+    "display-capture" 
   ]
 }

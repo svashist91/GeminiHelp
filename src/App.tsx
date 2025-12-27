@@ -134,25 +134,17 @@ const App: React.FC = () => {
     setIsLoading(true);
 
     try {
-      // 1. Attempt Screen Sharing with Fallback to Camera
+      // 1. Attempt Screen Sharing Only
       let visionStream: MediaStream | null = null;
       try {
-        // Attempt Screen Share
         visionStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 5 } });
         visionStreamRef.current = visionStream;
       } catch (err) {
-        console.warn("Screen share disallowed or failed, attempting camera fallback:", err);
-        try {
-          // Attempt Camera fallback if screen share is blocked by policy
-          visionStream = await navigator.mediaDevices.getUserMedia({ video: true });
-          visionStreamRef.current = visionStream;
-        } catch (camErr) {
-          console.error("Camera fallback also failed:", camErr);
-          alert("Interaction Mode requires vision (Screen Share or Camera). Please grant the necessary permissions in your browser.");
-          setIsInteractionMode(false);
-          setIsLoading(false);
-          return;
-        }
+        console.warn("Screen share disallowed or cancelled:", err);
+        // If user cancels screen share, we abort the session
+        setIsInteractionMode(false);
+        setIsLoading(false);
+        return;
       }
 
       // 2. Start Microphone
@@ -179,7 +171,7 @@ const App: React.FC = () => {
           source.connect(scriptProcessor);
           scriptProcessor.connect(inputAudioContextRef.current!.destination);
 
-          // Setup Vision Streaming (Screen or Camera frames)
+          // Setup Vision Streaming (Screen frames)
           if (videoRef.current && visionStream) {
             videoRef.current.srcObject = visionStream;
             videoRef.current.play();
