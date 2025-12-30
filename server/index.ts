@@ -1,12 +1,13 @@
 import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, Modality } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import cors from 'cors';
 import http from 'http';
 import path from 'path';
 import fs from 'fs';
+import { DRONA_SYSTEM_PROMPT, DRONA_INTERACTION_PROMPT } from '../src/prompts/drona';
 
 // --- CONFIGURATION ---
 const envLocalPath = path.resolve(__dirname, '../.env.local');
@@ -33,7 +34,8 @@ app.use(cors());
 app.use(express.json()); 
 
 const PORT = 3001;
-const MODEL_NAME = 'gemini-2.5-flash'; 
+const CHAT_MODEL = "gemini-2.5-flash";
+const LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-09-2025";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -71,7 +73,10 @@ app.post('/api/chat', async (req, res) => {
     
     // Use models.generateContentStream instead of chats.create().sendMessageStream()
     const result = await client.models.generateContentStream({
-      model: MODEL_NAME,
+      model: CHAT_MODEL,
+      config: {
+        systemInstruction: DRONA_SYSTEM_PROMPT
+      },
       contents
     });
     
@@ -133,15 +138,39 @@ app.delete('/api/sessions/:id', async (req, res) => {
 // --- 3. LIVE ROUTE ---
 wss.on('connection', async (ws: WebSocket) => {
   try {
+    console.log('[LIVE] connecting model=', LIVE_MODEL);
     const client = new GoogleGenAI({ apiKey: GEMINI_KEY });
     const session = await client.live.connect({
-      model: MODEL_NAME,
-      config: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } } }
+      model: LIVE_MODEL,
+      callbacks: {
+        onmessage: (msg: any) => {
+          if (msg?.error) console.error('[LIVE] msg.error', msg.error);
+          ws.send(JSON.stringify(msg));
+        },
+        onerror: (err: any) => { 
+          console.error('[LIVE] session error:', err); 
+          ws.close(); 
+        },
+        onclose: () => {
+          console.log('[LIVE] session closed');
+          ws.close();
+        }
+      },
+      config: { 
+        systemInstruction: DRONA_INTERACTION_PROMPT,
+        responseModalities: [Modality.AUDIO], 
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } } 
+      }
     });
-    session.on('message', (msg: any) => ws.send(JSON.stringify(msg)));
     ws.on('message', (data) => { try { session.sendRealtimeInput(JSON.parse(data.toString()).realtimeInput); } catch(e){} });
-    ws.on('close', () => session.close());
-  } catch (err) { ws.close(); }
+    ws.on('close', (code, reason) => {
+      console.log('[WS] closed', { code, reason: reason?.toString() });
+      try { session.close(); } catch {}
+    });
+  } catch (err) { 
+    console.error('[LIVE] connection error:', err);
+    ws.close(); 
+  }
 });
 
 server.listen(PORT, () => {
