@@ -6,9 +6,20 @@ interface VoiceOverlayProps {
   isSpeaking: boolean;
   isListening: boolean;
   onClose: () => void;
+  status: "idle" | "requesting_permissions" | "connecting" | "active" | "reconnecting" | "error";
+  error?: string;
+  onRetry?: () => void;
 }
 
-const VoiceOverlay: React.FC<VoiceOverlayProps> = ({ isActive, isSpeaking, isListening, onClose }) => {
+const VoiceOverlay: React.FC<VoiceOverlayProps> = ({ 
+  isActive, 
+  isSpeaking, 
+  isListening, 
+  onClose,
+  status,
+  error,
+  onRetry
+}) => {
   if (!isActive) return null;
 
   return (
@@ -70,24 +81,69 @@ const VoiceOverlay: React.FC<VoiceOverlayProps> = ({ isActive, isSpeaking, isLis
           </div>
         </div>
 
-        {/* 3. Dynamic Text Feedback */}
-        <div className="text-center space-y-2 h-16">
-          {isSpeaking && (
-            <p className="text-lg font-medium text-white animate-in slide-in-from-bottom-2 fade-in">
-              " I'm explaining the next step... "
-            </p>
-          )}
-          {!isSpeaking && isListening && (
-            <p className="text-lg font-medium text-slate-400 animate-in slide-in-from-bottom-2 fade-in">
-              " Listening to you... "
-            </p>
-          )}
-           {!isSpeaking && !isListening && (
-            <p className="text-sm font-medium text-slate-500 italic">
-              Watching your screen. Ask me anything.
-            </p>
-          )}
+        {/* 3. Status Label - Always Visible */}
+        <div className="text-center">
+          <div className="inline-flex items-center gap-3 px-6 py-3 rounded-full bg-slate-900/70 border border-slate-700 shadow-lg">
+            <div className={`w-3 h-3 rounded-full ${
+              status === "active" ? "bg-emerald-500 animate-pulse" :
+              status === "connecting" || status === "reconnecting" ? "bg-yellow-500 animate-pulse" :
+              status === "error" ? "bg-red-500" :
+              status === "requesting_permissions" ? "bg-blue-500 animate-pulse" :
+              "bg-slate-500"
+            }`}></div>
+            <span className="text-sm font-bold text-slate-200 uppercase tracking-wider">
+              {status === "requesting_permissions" ? "Permission needed" :
+               status === "connecting" ? "Connecting…" :
+               status === "active" ? "Active" :
+               status === "reconnecting" ? "Reconnecting…" :
+               status === "error" ? "Error" :
+               "Idle"}
+            </span>
+          </div>
         </div>
+
+        {/* 4. Error Message & Retry */}
+        {status === "error" && error && (
+          <div className="text-center space-y-4 max-w-md">
+            <p className="text-sm font-medium text-red-400 px-4">{error}</p>
+            {onRetry && (
+              <button
+                onClick={onRetry}
+                className="px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-full font-bold text-sm transition-colors shadow-lg hover:shadow-indigo-500/20"
+              >
+                Retry
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* 5. Reconnecting Message */}
+        {status === "reconnecting" && error && (
+          <div className="text-center space-y-2 max-w-md">
+            <p className="text-sm font-medium text-yellow-400 px-4">{error}</p>
+          </div>
+        )}
+
+        {/* 6. Dynamic Text Feedback (only when active) */}
+        {status === "active" && (
+          <div className="text-center space-y-2 h-16">
+            {isSpeaking && (
+              <p className="text-lg font-medium text-white animate-in slide-in-from-bottom-2 fade-in">
+                " I'm explaining the next step... "
+              </p>
+            )}
+            {!isSpeaking && isListening && (
+              <p className="text-lg font-medium text-slate-400 animate-in slide-in-from-bottom-2 fade-in">
+                " Listening to you... "
+              </p>
+            )}
+            {!isSpeaking && !isListening && (
+              <p className="text-sm font-medium text-slate-500 italic">
+                Watching your screen. Ask me anything.
+              </p>
+            )}
+          </div>
+        )}
 
       </div>
 
