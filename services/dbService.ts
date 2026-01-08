@@ -1,6 +1,18 @@
 const API_URL = 'http://localhost:3001/api';
 
 export const dbService = {
+  async syncUser(user: any) {
+    await fetch(`${API_URL}/users`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: user.id,
+        email: user.primaryEmailAddress?.emailAddress,
+        fullName: user.fullName
+      })
+    });
+  },
+
   async getSessions(userId: string) {
     const res = await fetch(`${API_URL}/sessions?userId=${userId}`);
     return res.json();

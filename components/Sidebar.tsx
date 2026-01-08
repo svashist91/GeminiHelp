@@ -10,6 +10,8 @@ interface SidebarProps {
   onDeleteSession: (id: string, e: React.MouseEvent) => void;
   isOpen: boolean;
   onToggle: () => void;
+  onOpenPricing: () => void;
+  onOpenSearch: () => void;
 }
 
 const Sidebar: React.FC<SidebarProps> = ({ 
@@ -19,7 +21,9 @@ const Sidebar: React.FC<SidebarProps> = ({
   onNewChat, 
   onDeleteSession,
   isOpen,
-  onToggle
+  onToggle,
+  onOpenPricing,
+  onOpenSearch
 }) => {
   return (
     <>
@@ -32,6 +36,20 @@ const Sidebar: React.FC<SidebarProps> = ({
 
       <aside className={`fixed md:relative inset-y-0 left-0 z-30 w-72 bg-slate-50 dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 flex flex-col transition-transform duration-300 transform ${isOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
         <div className="p-4 flex flex-col h-full">
+          <div className="flex items-center justify-between mb-4">
+            <button
+              onClick={onOpenSearch}
+              className="p-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors shadow-sm"
+              title="Search chats"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="11" cy="11" r="8"></circle>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+              </svg>
+            </button>
+            <span className="text-[11px] uppercase tracking-[0.2em] text-slate-500 dark:text-slate-500 font-bold">Drona</span>
+          </div>
+
           <button
             onClick={() => {
               onNewChat();
@@ -99,6 +117,15 @@ const Sidebar: React.FC<SidebarProps> = ({
                <span className="text-[10px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-widest">Drona v1.1.0</span>
              </div>
           </div>
+        </div>
+
+        <div className="p-4 border-t border-slate-200 dark:border-slate-800">
+          <button
+            onClick={onOpenPricing}
+            className="w-full py-3 px-4 bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-xl font-semibold shadow-lg hover:from-indigo-500 hover:to-purple-500 transition-all"
+          >
+            Upgrade Plan
+          </button>
         </div>
       </aside>
     </>

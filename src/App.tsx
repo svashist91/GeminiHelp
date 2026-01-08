@@ -12,9 +12,12 @@ import {
   SignedOut,
   SignInButton,
   UserButton,
-  useUser
+  useUser,
+  useAuth
 } from "@clerk/clerk-react";
 import { dbService } from '../services/dbService';
+import PricingModal from '../components/PricingModal';
+import SearchModal from '../components/SearchModal';
 
 const LandingPage = () => (
   <div className="flex flex-col items-center justify-center h-screen bg-slate-900 text-white p-6 text-center">
@@ -43,6 +46,7 @@ const App: React.FC = () => {
 
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const { user } = useUser();
+  const { getToken } = useAuth();
 
   const [activeSessionId, setActiveSessionId] = useState<string>(() => {
     const lastActive = localStorage.getItem('drona_active_id');
@@ -53,7 +57,16 @@ const App: React.FC = () => {
   const [isInteractionMode, setIsInteractionMode] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isListening, setIsListening] = useState(false);
+  const [isInteractionStreaming, setIsInteractionStreaming] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [isPricingOpen, setIsPricingOpen] = useState(false);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [areAllExpanded, setAreAllExpanded] = useState(true);
+
+  type InteractionStatus = "idle" | "requesting_permissions" | "connecting" | "active" | "reconnecting" | "error";
+  const [interactionStatus, setInteractionStatus] = useState<InteractionStatus>("idle");
+  const [interactionError, setInteractionError] = useState<string>("");
 
   // 2. Refs
   const inputAudioContextRef = useRef<AudioContext | null>(null);
@@ -74,8 +87,22 @@ const App: React.FC = () => {
   const currentOutputTransRef = useRef('');
   const lastUserMsgIdRef = useRef<string | null>(null);
   const lastDronaMsgIdRef = useRef<string | null>(null);
+  
+  // Transcript timeout safety
+  const transcriptTimeoutRef = useRef<number | null>(null);
+  const firstTranscriptTimeRef = useRef<number | null>(null);
   const sessionsRef = useRef<ChatSession[]>([]);
   const activeSessionIdRef = useRef<string>('');
+
+  const stopRequestedRef = useRef(false);
+  const reconnectAttemptedRef = useRef(false);
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectingRef = useRef(false);
+
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const mediaSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const heartbeatRef = useRef<number | null>(null);
 
   // 3. Effects
   useEffect(() => {
@@ -88,26 +115,34 @@ const App: React.FC = () => {
     }
   }, [isDarkMode]);
 
+  // Extract session loading logic into a reusable function
+  const refreshSessions = useCallback(async () => {
+    if (!user) return;
+    try {
+      const data = await dbService.getSessions(user.id);
+      const parsed = data.map((s: any) => ({
+        ...s,
+        createdAt: new Date(s.createdAt),
+        messages: s.messages.map((m: any) => ({
+          ...m,
+          timestamp: new Date(m.timestamp)
+        }))
+      }));
+      setSessions(parsed);
+    } catch (e) {
+      console.error('Error refreshing sessions:', e);
+    }
+  }, [user]);
+
   useEffect(() => {
     if (user) {
       setIsLoading(true);
-      dbService.getSessions(user.id).then(data => {
-        const parsed = data.map((s: any) => ({
-          ...s,
-          createdAt: new Date(s.createdAt),
-          messages: s.messages.map((m: any) => ({
-            ...m,
-            timestamp: new Date(m.timestamp)
-          }))
-        }));
-        setSessions(parsed);
-        setIsLoading(false);
-      }).catch(error => {
-        console.error('Error loading sessions:', error);
-        setIsLoading(false);
-      });
+      dbService.syncUser(user)
+        .then(() => refreshSessions())
+        .catch(error => console.error('Error syncing user:', error))
+        .finally(() => setIsLoading(false));
     }
-  }, [user]);
+  }, [user, refreshSessions]);
 
   useEffect(() => {
     localStorage.setItem('drona_active_id', activeSessionId);
@@ -120,6 +155,34 @@ const App: React.FC = () => {
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
+
+  useEffect(() => {
+    return () => {
+      // Cleanup reconnect timer on unmount
+      if (reconnectTimerRef.current) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    // Check if user just returned from Stripe
+    const query = new URLSearchParams(window.location.search);
+    const tier = query.get('tier');
+    
+    if (tier) {
+      // 1. Clear the URL so they don't see the ugly parameters
+      window.history.replaceState({}, document.title, "/");
+      
+      // 2. Show success (Simple alert for MVP, or a beautiful modal later)
+      alert(`🎉 Payment Successful! You are now on the ${tier.toUpperCase()} plan.`);
+      
+      // TODO: In a production app, sync subscription_status to the database here
+      // You would fetch the user's subscription status from your backend/DB
+      // and update local state to unlock features accordingly
+    }
+  }, []);
 
   const activeSession = sessions.find(s => s.id === activeSessionId) || null;
 
@@ -190,6 +253,23 @@ const App: React.FC = () => {
     }
   };
 
+  const handleNavigateToMessage = useCallback(async (sessionId: string, messageId: string) => {
+    setIsSearchOpen(false);
+    await handleSelectSession(sessionId);
+
+    window.setTimeout(() => {
+      const el = document.getElementById(`msg-${messageId}`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+      setHighlightedMessageId(messageId);
+      window.setTimeout(() => {
+        setHighlightedMessageId(prev => (prev === messageId ? null : prev));
+      }, 1500);
+    }, 300);
+  }, [handleSelectSession]);
+
+
   const stopAllAudio = () => {
     sourcesRef.current.forEach(source => {
       try {
@@ -202,97 +282,64 @@ const App: React.FC = () => {
     nextStartTimeRef.current = 0;
   };
 
-  const startInteractionMode = async () => {
-    if (isInteractionMode) {
-      stopInteractionMode();
-      return;
-    }
+  const hasLiveAudio = (s: MediaStream | null) => !!s && s.getAudioTracks().some(t => t.readyState === "live");
+  const hasLiveVideo = (s: MediaStream | null) => !!s && s.getVideoTracks().some(t => t.readyState === "live");
 
-    let sessionId = activeSessionIdRef.current || activeSessionId;
-    if (!sessionId) {
-      sessionId = createNewSession();
+  // Convert Float32 PCM to Int16 PCM (little-endian) for Gemini Live
+  const floatTo16BitPCM = (float32: Float32Array): Uint8Array => {
+    const buffer = new ArrayBuffer(float32.length * 2);
+    const view = new DataView(buffer);
+    let offset = 0;
+    for (let i = 0; i < float32.length; i++, offset += 2) {
+      let s = Math.max(-1, Math.min(1, float32[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
     }
-    activeSessionIdRef.current = sessionId;
-    setIsInteractionMode(true);
-    setIsLoading(true);
+    return new Uint8Array(buffer);
+  };
 
-    try {
-      let visionStream: MediaStream | null = null;
-      try {
-        visionStream = await navigator.mediaDevices.getDisplayMedia({
-          video: { frameRate: 5 }
-        });
-        visionStreamRef.current = visionStream;
-      } catch (err) {
-        console.warn("Screen share disallowed or cancelled:", err);
-        setIsInteractionMode(false);
-        setIsLoading(false);
-        return;
+  const ensureAudioCapturePipeline = () => {
+    if (!inputAudioContextRef.current || !streamRef.current) return;
+    if (scriptProcessorRef.current && mediaSourceRef.current) return; // already running
+
+    const ctx = inputAudioContextRef.current;
+    const source = ctx.createMediaStreamSource(streamRef.current);
+    const processor = ctx.createScriptProcessor(4096, 1, 1);
+
+    let debugLogged = false; // One-time debug log
+
+    processor.onaudioprocess = (e) => {
+      const inputData = e.inputBuffer.getChannelData(0);
+      
+      // Use the helper for reliable Float32 -> Int16 conversion
+      const pcmBlob = createBlob(inputData);
+      
+      if (liveSessionRef.current) {
+        try {
+          liveSessionRef.current.sendRealtimeInput({ media: pcmBlob });
+        } catch (e) {
+          console.error("Error sending audio frame:", e);
+        }
       }
+    };
 
-      const audioStream = await navigator.mediaDevices.getUserMedia({
-        audio: true
-      });
-      streamRef.current = audioStream;
+    source.connect(processor);
+    processor.connect(ctx.destination);
 
-      inputAudioContextRef.current = new (window.AudioContext ||
-        (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      outputAudioContextRef.current = new (window.AudioContext ||
-        (window as any).webkitAudioContext)({ sampleRate: 24000 });
+    mediaSourceRef.current = source;
+    scriptProcessorRef.current = processor;
+  };
 
-      sessionPromiseRef.current = geminiService.connectLive({
-        onopen: () => {
+  const softFailInteractionMode = (msg: string) => {
+    // keep overlay up
+    setIsInteractionMode(true);
           setIsLoading(false);
+    setIsListening(false);
+    setIsSpeaking(false);
+    setInteractionStatus("error");
+    setInteractionError(msg);
+  };
 
-          const source = inputAudioContextRef.current!.createMediaStreamSource(
-            audioStream
-          );
-          const scriptProcessor = inputAudioContextRef.current!.createScriptProcessor(
-            4096,
-            1,
-            1
-          );
-          scriptProcessor.onaudioprocess = (e) => {
-            const inputData = e.inputBuffer.getChannelData(0);
-            const pcmBlob = createBlob(inputData);
-            sessionPromiseRef.current?.then((session) => {
-              session.sendRealtimeInput({ media: pcmBlob });
-            });
-          };
-          source.connect(scriptProcessor);
-          scriptProcessor.connect(inputAudioContextRef.current!.destination);
-
-          if (videoRef.current && visionStream) {
-            videoRef.current.srcObject = visionStream;
-            videoRef.current.play();
-
-            frameIntervalRef.current = window.setInterval(() => {
-              const canvas = canvasRef.current;
-              const video = videoRef.current;
-              if (
-                canvas &&
-                video &&
-                video.readyState >= 2
-              ) {
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                const ctx = canvas.getContext('2d');
-                if (ctx) {
-                  ctx.drawImage(video, 0, 0);
-                  const base64 = canvas
-                    .toDataURL('image/jpeg', 0.5)
-                    .split(',')[1];
-                  sessionPromiseRef.current?.then(session => {
-                    session.sendRealtimeInput({
-                      media: { data: base64, mimeType: 'image/jpeg' }
-                    });
-                  });
-                }
-              }
-            }, 1000);
-          }
-        },
-        onmessage: async (message: LiveServerMessage) => {
+  const onLiveMessage = useCallback(async (message: LiveServerMessage) => {
           const base64Audio =
             message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
           if (base64Audio && outputAudioContextRef.current) {
@@ -326,62 +373,252 @@ const App: React.FC = () => {
           }
 
           if (message.serverContent?.inputTranscription) {
+            const text = message.serverContent.inputTranscription.text;
+            console.log("📝 [Front] Rx User Trans:", text);
             setIsListening(true);
-            currentInputTransRef.current +=
-              message.serverContent.inputTranscription.text;
+            currentInputTransRef.current += text;
             syncInteractionModeTranscription();
           }
 
           if (message.serverContent?.outputTranscription) {
-            currentOutputTransRef.current +=
-              message.serverContent.outputTranscription.text;
+            const text = message.serverContent.outputTranscription.text;
+            console.log("📝 [Front] Rx Drona Trans:", text);
+            currentOutputTransRef.current += text;
             syncInteractionModeTranscription();
           }
 
           if (message.serverContent?.turnComplete) {
-            try {
-              if (activeSessionIdRef.current) {
-                if (lastUserMsgIdRef.current && currentInputTransRef.current.trim()) {
-                  await dbService.saveMessage(
-                    {
-                      id: lastUserMsgIdRef.current,
-                      role: Role.USER,
-                      content: currentInputTransRef.current.trim(),
-                      timestamp: new Date()
-                    },
-                    activeSessionIdRef.current
-                  );
-                }
+            console.log("🏁 [Front] Turn Complete. Triggering save...");
+            // Turn complete: finalize transcripts and persist to DB
+            await finalizeTranscriptTurn(false);
+          }
+  }, []);
 
-                if (lastDronaMsgIdRef.current && currentOutputTransRef.current.trim()) {
-                  await dbService.saveMessage(
-                    {
-                      id: lastDronaMsgIdRef.current,
-                      role: Role.DRONA,
-                      content: currentOutputTransRef.current.trim(),
-                      timestamp: new Date()
-                    },
-                    activeSessionIdRef.current
-                  );
-                }
+  const reconnectLiveSession = async () => {
+    if (stopRequestedRef.current) return;
+
+    setIsInteractionMode(true);
+    setInteractionStatus("connecting");
+    setIsLoading(true);
+
+    // close only the live session
+    if (liveSessionRef.current) {
+      try { liveSessionRef.current.close(); } catch {}
+      liveSessionRef.current = null;
+    }
+
+    // reuse or reacquire streams
+    if (!hasLiveVideo(visionStreamRef.current)) {
+      setInteractionStatus("requesting_permissions");
+      try {
+        visionStreamRef.current = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 5 } });
+        if (videoRef.current) {
+          videoRef.current.srcObject = visionStreamRef.current;
+          await videoRef.current.play().catch(() => {});
+        }
+      } catch (err) {
+        softFailInteractionMode("Screen share permission denied. Please allow screen sharing to continue.");
+        return;
+      }
+    }
+
+    if (!hasLiveAudio(streamRef.current)) {
+      setInteractionStatus("requesting_permissions");
+      try {
+        streamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (err) {
+        softFailInteractionMode("Microphone permission denied. Please allow microphone access to continue.");
+        return;
+      }
+    }
+
+    // DO NOT recreate audio contexts here (only if null)
+    if (!inputAudioContextRef.current) {
+      inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+    }
+    if (!outputAudioContextRef.current) {
+      outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+    }
+
+    // Setup audio processing if not already set up
+    ensureAudioCapturePipeline();
+
+    // Setup video frame capture if not already set up
+    if (videoRef.current && visionStreamRef.current) {
+      videoRef.current.srcObject = visionStreamRef.current;
+      videoRef.current.play();
+
+      // Only start interval if not already running
+      if (frameIntervalRef.current === null) {
+        frameIntervalRef.current = window.setInterval(() => {
+          const canvas = canvasRef.current;
+          const video = videoRef.current;
+          if (canvas && video && video.readyState >= 2) {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              ctx.drawImage(video, 0, 0);
+              const base64 = canvas.toDataURL('image/jpeg', 0.5).split(',')[1];
+              const session = liveSessionRef.current;
+              if (session) {
+                try {
+                  session.sendRealtimeInput({
+                    media: { data: base64, mimeType: 'image/jpeg' }
+                  });
+                } catch {}
               }
-            } catch (e) {
-              console.error('Error saving interaction mode messages:', e);
             }
+          }
+        }, 1000);
+      }
+    }
 
-            setIsListening(false);
-            currentInputTransRef.current = '';
-            currentOutputTransRef.current = '';
-            lastUserMsgIdRef.current = null;
-            lastDronaMsgIdRef.current = null;
+    // reconnect live
+    sessionPromiseRef.current = geminiService.connectLive({
+      onopen: () => {
+        reconnectAttemptsRef.current = 0;
+        setInteractionStatus("active");
+        setInteractionError("");
+        setIsLoading(false);
+
+        // Ensure audio capture pipeline is running
+        ensureAudioCapturePipeline();
+      },
+      onmessage: onLiveMessage,
+      onerror: (e: any) => scheduleReconnect("ws-error", e),
+      onclose: (e: any) => scheduleReconnect("ws-close", e),
+    });
+
+    liveSessionRef.current = await sessionPromiseRef.current;
+  };
+
+  const scheduleReconnect = (why: string, evt?: any) => {
+    if (stopRequestedRef.current) return;
+    if (reconnectingRef.current) return;
+
+    reconnectingRef.current = true;
+    setInteractionStatus("reconnecting");
+
+    const attempt = reconnectAttemptsRef.current + 1;
+    reconnectAttemptsRef.current = attempt;
+
+    const base = Math.min(4000, 250 * Math.pow(2, attempt - 1)); // 250, 500, 1000, 2000, 4000
+    const jitter = Math.floor(Math.random() * 250);
+    const delay = base + jitter;
+
+    const code = evt?.code ? ` code=${evt.code}` : "";
+    const reason = evt?.reason ? ` ${evt.reason}` : "";
+    setInteractionError(`Live disconnected (${why}${code}${reason}). Reconnecting… (attempt ${attempt})`);
+
+    if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = window.setTimeout(() => {
+      reconnectTimerRef.current = null;
+      reconnectingRef.current = false;
+      reconnectLiveSession().catch((e) => {
+        scheduleReconnect("reconnect-failed", { reason: String(e?.message || e) });
+      });
+    }, delay);
+  };
+
+  const startInteractionMode = async () => {
+    if (isInteractionMode) {
+      hardStopInteractionMode();
+      return;
+    }
+
+    stopRequestedRef.current = false;
+    reconnectAttemptedRef.current = false;
+    reconnectAttemptsRef.current = 0;
+    reconnectingRef.current = false;
+    if (reconnectTimerRef.current) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    setInteractionError("");
+    setInteractionStatus("requesting_permissions");
+
+    let sessionId = activeSessionIdRef.current || activeSessionId;
+    if (!sessionId) {
+      sessionId = createNewSession();
+    }
+    activeSessionIdRef.current = sessionId;
+    setIsInteractionMode(true);
+    setIsLoading(true);
+
+    try {
+      let visionStream: MediaStream | null = null;
+      try {
+        visionStream = await navigator.mediaDevices.getDisplayMedia({
+          video: { frameRate: 5 }
+        });
+        visionStreamRef.current = visionStream;
+      } catch (err) {
+        console.warn("Screen share disallowed or cancelled:", err);
+        softFailInteractionMode("Screen share permission denied. Please allow screen sharing to use Interaction Mode.");
+        return;
+      }
+
+      let audioStream: MediaStream;
+      try {
+        audioStream = await navigator.mediaDevices.getUserMedia({
+          audio: true
+        });
+        streamRef.current = audioStream;
+      } catch (err) {
+        console.warn("Microphone permission denied:", err);
+        softFailInteractionMode("Microphone permission denied. Please allow microphone access to use Interaction Mode.");
+        return;
+      }
+
+      inputAudioContextRef.current = new (window.AudioContext ||
+        (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      outputAudioContextRef.current = new (window.AudioContext ||
+        (window as any).webkitAudioContext)({ sampleRate: 24000 });
+
+      setInteractionStatus("connecting");
+
+      sessionPromiseRef.current = geminiService.connectLive({
+        onopen: () => {
+          setIsLoading(false);
+          setInteractionStatus("active");
+
+          // Setup audio capture pipeline
+          ensureAudioCapturePipeline();
+
+          // Setup video frame capture (only if not already running)
+          if (videoRef.current && visionStream) {
+            videoRef.current.srcObject = visionStream;
+            videoRef.current.play();
+
+            if (frameIntervalRef.current === null) {
+              frameIntervalRef.current = window.setInterval(() => {
+                const canvas = canvasRef.current;
+                const video = videoRef.current;
+                if (canvas && video && video.readyState >= 2) {
+                  canvas.width = video.videoWidth;
+                  canvas.height = video.videoHeight;
+                  const ctx = canvas.getContext('2d');
+                  if (ctx) {
+                    ctx.drawImage(video, 0, 0);
+                    const base64 = canvas.toDataURL('image/jpeg', 0.5).split(',')[1];
+                    const session = liveSessionRef.current;
+                    if (session) {
+                      try {
+                        session.sendRealtimeInput({
+                          media: { data: base64, mimeType: 'image/jpeg' }
+                        });
+                      } catch {}
+                    }
+                  }
+                }
+              }, 1000);
+            }
           }
         },
-        onerror: (e) => {
-          stopInteractionMode();
-        },
-        onclose: () => {
-          stopInteractionMode();
-        }
+        onmessage: onLiveMessage,
+        onerror: (e: any) => scheduleReconnect("ws-error", e),
+        onclose: (e: any) => scheduleReconnect("ws-close", e)
       });
 
       sessionPromiseRef.current.then(session => {
@@ -389,40 +626,169 @@ const App: React.FC = () => {
       });
     } catch (err) {
       console.error("Error starting interaction mode:", err);
-      stopInteractionMode();
+      softFailInteractionMode(`Failed to start Interaction Mode: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
 
+  // Finalize transcript turn: mark messages as complete, persist to DB, clear refs
+  const finalizeTranscriptTurn = async (isTimeout = false) => {
+    console.log("💾 [Front] Finalizing Turn. Session:", activeSessionIdRef.current);
+    console.log("   > User Buffer:", currentInputTransRef.current);
+    console.log("   > Drona Buffer:", currentOutputTransRef.current);
+    
+    // Clear timeout if it exists
+    if (transcriptTimeoutRef.current) {
+      window.clearTimeout(transcriptTimeoutRef.current);
+      transcriptTimeoutRef.current = null;
+    }
+
+    try {
+      const currentSessionId = activeSessionIdRef.current;
+      
+      if (currentSessionId) {
+        // --- Persist to DB: Save User Message ---
+        if (currentInputTransRef.current && currentInputTransRef.current.trim()) {
+          const userMsgId = lastUserMsgIdRef.current || Date.now().toString() + '-int-u';
+          console.log("   > Saving User Message to DB...");
+          try {
+            await dbService.saveMessage({
+              id: userMsgId,
+              role: Role.USER,
+              content: currentInputTransRef.current.trim(),
+              timestamp: new Date()
+            }, currentSessionId);
+            console.log("   ✅ User Message Saved!");
+            
+            // Ensure the ID is set for state updates
+            if (!lastUserMsgIdRef.current) {
+              lastUserMsgIdRef.current = userMsgId;
+            }
+          } catch (e) {
+            console.error("   ❌ User Save FAILED:", e);
+          }
+        } else {
+          console.log("   ⚠️ Skipping user message save - no content");
+        }
+
+        // --- Persist to DB: Save Drona Message ---
+        if (currentOutputTransRef.current && currentOutputTransRef.current.trim()) {
+          const dronaMsgId = lastDronaMsgIdRef.current || (Date.now() + 1).toString() + '-int-d';
+          console.log("   > Saving Drona Message to DB...");
+          try {
+            await dbService.saveMessage({
+              id: dronaMsgId,
+              role: Role.DRONA,
+              content: currentOutputTransRef.current.trim(),
+              timestamp: new Date()
+            }, currentSessionId);
+            console.log("   ✅ Drona Message Saved!");
+            
+            // Ensure the ID is set for state updates
+            if (!lastDronaMsgIdRef.current) {
+              lastDronaMsgIdRef.current = dronaMsgId;
+            }
+          } catch (e) {
+            console.error("   ❌ Drona Save FAILED:", e);
+          }
+        } else {
+          console.log("   ⚠️ Skipping drona message save - no content");
+        }
+
+        // Finalize streaming state: mark messages as complete (remove isStreaming flag)
+        setSessions(prev =>
+          prev.map(s => {
+            if (s.id !== currentSessionId) return s;
+            
+            let updatedMessages = s.messages.map(m => {
+              if (m.id === lastUserMsgIdRef.current || m.id === lastDronaMsgIdRef.current) {
+                return { ...m, isStreaming: false };
+              }
+              return m;
+            });
+
+            // Add timeout warning message if needed
+            if (isTimeout && (lastUserMsgIdRef.current || lastDronaMsgIdRef.current)) {
+              updatedMessages.push({
+                id: Date.now().toString() + '-timeout',
+                role: Role.DRONA,
+                content: '⚠️ Interaction timed out — please retry.',
+                timestamp: new Date(),
+                isStreaming: false
+              });
+            }
+
+            return {
+              ...s,
+              messages: updatedMessages
+            };
+          })
+        );
+      }
+    } catch (e) {
+      console.error('Error finalizing interaction mode messages:', e);
+    }
+
+    // Clear streaming state and refs
+    setIsInteractionStreaming(false);
+    setIsListening(false);
+    currentInputTransRef.current = '';
+    currentOutputTransRef.current = '';
+    lastUserMsgIdRef.current = null;
+    lastDronaMsgIdRef.current = null;
+    firstTranscriptTimeRef.current = null;
+  };
+
+  // Streaming message update: update transcript text in real-time
   const syncInteractionModeTranscription = () => {
+    // Track first transcript event for timeout safety
+    if (!firstTranscriptTimeRef.current && 
+        (currentInputTransRef.current.trim() || currentOutputTransRef.current.trim())) {
+      firstTranscriptTimeRef.current = Date.now();
+      setIsInteractionStreaming(true);
+      console.log("[FRONTEND] 🚀 Starting transcript streaming");
+      
+      // Set up 12-second timeout safety
+      transcriptTimeoutRef.current = window.setTimeout(() => {
+        console.warn('Transcript timeout: finalizing turn after 12 seconds');
+        finalizeTranscriptTurn(true);
+      }, 12000);
+    }
+
     setSessions(prev =>
       prev.map(s => {
         if (s.id !== activeSessionIdRef.current) return s;
 
         let newMessages = [...s.messages];
 
+        // Streaming user message update - overwrite existing message or create new
         if (currentInputTransRef.current) {
           if (!lastUserMsgIdRef.current) {
             lastUserMsgIdRef.current =
               Date.now().toString() + '-int-u';
+            console.log("[FRONTEND] ➕ Creating new user message in UI:", lastUserMsgIdRef.current);
             newMessages.push({
               id: lastUserMsgIdRef.current,
               role: Role.USER,
               content: currentInputTransRef.current,
-              timestamp: new Date()
+              timestamp: new Date(),
+              isStreaming: true
             });
           } else {
+            console.log("[FRONTEND] 🔄 Updating existing user message:", lastUserMsgIdRef.current);
             newMessages = newMessages.map(m =>
               m.id === lastUserMsgIdRef.current
-                ? { ...m, content: currentInputTransRef.current }
+                ? { ...m, content: currentInputTransRef.current, isStreaming: true }
                 : m
             );
           }
         }
 
+        // Streaming drona message update - overwrite existing message or create new
         if (currentOutputTransRef.current) {
           if (!lastDronaMsgIdRef.current) {
             lastDronaMsgIdRef.current =
               Date.now().toString() + '-int-d';
+            console.log("[FRONTEND] ➕ Creating new drona message in UI:", lastDronaMsgIdRef.current);
             newMessages.push({
               id: lastDronaMsgIdRef.current,
               role: Role.DRONA,
@@ -431,9 +797,10 @@ const App: React.FC = () => {
               isStreaming: true
             });
           } else {
+            console.log("[FRONTEND] 🔄 Updating existing drona message:", lastDronaMsgIdRef.current);
             newMessages = newMessages.map(m =>
               m.id === lastDronaMsgIdRef.current
-                ? { ...m, content: currentOutputTransRef.current }
+                ? { ...m, content: currentOutputTransRef.current, isStreaming: true }
                 : m
             );
           }
@@ -463,17 +830,49 @@ const App: React.FC = () => {
     );
   };
 
-  const stopInteractionMode = () => {
+  const hardStopInteractionMode = async () => {
+    stopRequestedRef.current = true;
+    setInteractionStatus("idle");
     setIsInteractionMode(false);
     setIsSpeaking(false);
     setIsListening(false);
     setIsLoading(false);
     stopAllAudio();
 
+    // Finalize any pending transcripts before stopping
+    if (isInteractionStreaming) {
+      await finalizeTranscriptTurn(false);
+    }
+
+    if (reconnectTimerRef.current) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    
+    // Clear transcript timeout if it exists
+    if (transcriptTimeoutRef.current) {
+      window.clearTimeout(transcriptTimeoutRef.current);
+      transcriptTimeoutRef.current = null;
+    }
+    
+    reconnectingRef.current = false;
+    reconnectAttemptsRef.current = 0;
+
     if (frameIntervalRef.current) {
       clearInterval(frameIntervalRef.current);
       frameIntervalRef.current = null;
     }
+    if (heartbeatRef.current) {
+      clearInterval(heartbeatRef.current);
+      heartbeatRef.current = null;
+    }
+
+    // Disconnect audio nodes cleanly
+    try { scriptProcessorRef.current?.disconnect(); } catch {}
+    try { mediaSourceRef.current?.disconnect(); } catch {}
+    scriptProcessorRef.current = null;
+    mediaSourceRef.current = null;
+
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(t => t.stop());
       streamRef.current = null;
@@ -500,11 +899,44 @@ const App: React.FC = () => {
       outputAudioContextRef.current.close();
       outputAudioContextRef.current = null;
     }
+
+    // Refresh UI from DB to show latest transcripts
+    await refreshSessions();
   };
 
-  const handleSend = async (text: string) => {
+  const handleSend = async (text: string, attachments?: any[]) => {
     let currentId = activeSessionId;
     let userMsg: Message;
+    
+    // Extract attachment metadata
+    const selectedAttachments = attachments?.map((att, index) => ({
+      id: `${Date.now()}-${index}`,
+      name: att.file.name,
+      mimeType: att.file.type || 'application/octet-stream',
+      size: att.file.size,
+      previewUrl: att.previewUrl
+    })) || [];
+    
+    // Upload files first if attachments exist
+    let attachmentIds: string[] = [];
+    if (attachments && attachments.length > 0) {
+      setIsLoading(true);
+      try {
+        const files = attachments.map((a: any) => a.file);
+        attachmentIds = await geminiService.uploadFiles(files);
+      } catch (error) {
+        console.error('File upload failed:', error);
+        // Continue without attachments if upload fails
+      }
+    }
+    
+    // Build message content with attachment info
+    let messageContent = text;
+    if (attachments && attachments.length > 0) {
+      const fileNames = attachments.map((a: any) => a.file.name).join(', ');
+      messageContent = `${text}\n\n[Attached: ${fileNames}]`;
+    }
+    
     if (!currentId) {
       const newId = Date.now().toString();
       currentId = newId;
@@ -520,8 +952,9 @@ const App: React.FC = () => {
       userMsg = {
         id: Date.now().toString(),
         role: Role.USER,
-        content: text,
-        timestamp: new Date()
+        content: messageContent,
+        timestamp: new Date(),
+        attachments: selectedAttachments.length > 0 ? selectedAttachments : undefined
       };
       dbService.saveMessage(userMsg, currentId);
 
@@ -533,8 +966,9 @@ const App: React.FC = () => {
       userMsg = {
         id: Date.now().toString(),
         role: Role.USER,
-        content: text,
-        timestamp: new Date()
+        content: messageContent,
+        timestamp: new Date(),
+        attachments: selectedAttachments.length > 0 ? selectedAttachments : undefined
       };
       // Save user message to database for existing sessions
       dbService.saveMessage(userMsg, currentId);
@@ -594,7 +1028,7 @@ const App: React.FC = () => {
           parts: [{ text: m.content }]
         }));
 
-      const stream = geminiService.streamChat(history, text);
+      const stream = geminiService.streamChat(history, text, attachmentIds);
       let accumulated = '';
       for await (const chunk of stream) {
         accumulated += chunk;
@@ -662,7 +1096,20 @@ const App: React.FC = () => {
           isActive={isInteractionMode}
           isSpeaking={isSpeaking}
           isListening={isListening}
-          onClose={stopInteractionMode}
+          onClose={hardStopInteractionMode}
+          status={interactionStatus}
+          error={interactionError}
+          onRetry={() => {
+            reconnectAttemptsRef.current = 0;
+            reconnectingRef.current = false;
+            if (reconnectTimerRef.current) {
+              window.clearTimeout(reconnectTimerRef.current);
+              reconnectTimerRef.current = null;
+            }
+            reconnectLiveSession().catch((e) => {
+              scheduleReconnect("manual-retry-failed", { reason: String(e?.message || e) });
+            });
+          }}
         />
 
         <Sidebar
@@ -673,6 +1120,8 @@ const App: React.FC = () => {
           onDeleteSession={deleteSession}
           isOpen={isSidebarOpen}
           onToggle={() => setIsSidebarOpen(!isSidebarOpen)}
+          onOpenPricing={() => setIsPricingOpen(true)}
+          onOpenSearch={() => setIsSearchOpen(true)}
         />
 
         <div className="flex-1 flex flex-col relative min-w-0">
@@ -723,6 +1172,26 @@ const App: React.FC = () => {
                   </p>
                 </div>
               </div>
+            </div>
+
+            {/* Centered Expand/Collapse All Toggle */}
+            <div className="absolute left-1/2 top-1/2 transform -translate-x-1/2 -translate-y-1/2 hidden md:block z-20">
+              <button
+                onClick={() => setAreAllExpanded(!areAllExpanded)}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-xs font-medium text-slate-600 dark:text-slate-300 transition-colors border border-slate-200 dark:border-slate-700 shadow-sm"
+              >
+                {areAllExpanded ? (
+                  <>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m18 15-6-6-6 6"/></svg>
+                    <span>Collapse All</span>
+                  </>
+                ) : (
+                  <>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                    <span>Expand All</span>
+                  </>
+                )}
+              </button>
             </div>
 
             <div className="flex items-center gap-4">
@@ -812,7 +1281,12 @@ const App: React.FC = () => {
                 </div>
               ) : (
                 activeSession.messages.map(msg => (
-                  <MessageBubble key={msg.id} message={msg} />
+                  <MessageBubble
+                    key={msg.id}
+                    message={msg}
+                    highlighted={highlightedMessageId === msg.id}
+                    shouldExpand={areAllExpanded}
+                  />
                 ))
               )}
             </div>
@@ -822,9 +1296,22 @@ const App: React.FC = () => {
             onSend={handleSend}
             onVoiceClick={startInteractionMode}
             isVoiceActive={isInteractionMode}
-            disabled={isLoading}
+            disabled={isLoading || isInteractionStreaming}
           />
         </div>
+
+        <PricingModal
+          isOpen={isPricingOpen}
+          onClose={() => setIsPricingOpen(false)}
+          userId={user?.id || ''}
+        />
+
+        <SearchModal
+          isOpen={isSearchOpen}
+          onClose={() => setIsSearchOpen(false)}
+          onSelectHit={handleNavigateToMessage}
+          getToken={getToken}
+        />
       </SignedIn>
     </div>
   );
