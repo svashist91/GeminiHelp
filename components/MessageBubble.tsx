@@ -1,5 +1,5 @@
 
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { Message, Role } from '../types';
 import { useUser } from '@clerk/clerk-react';
 import ReactMarkdown from 'react-markdown';
@@ -8,11 +8,29 @@ import remarkGfm from 'remark-gfm';
 interface MessageBubbleProps {
   message: Message;
   highlighted?: boolean;
+  shouldExpand?: boolean;
 }
 
-const MessageBubble: React.FC<MessageBubbleProps> = ({ message, highlighted }) => {
+const MessageBubble: React.FC<MessageBubbleProps> = ({ message, highlighted, shouldExpand }) => {
+  console.log('Message Data:', message);
   const isDrona = message.role === Role.DRONA;
   const { user } = useUser();
+  const [isExpanded, setIsExpanded] = useState(true);
+
+  // Sync expand state with prop
+  useEffect(() => {
+    if (shouldExpand !== undefined) {
+      setIsExpanded(shouldExpand);
+    }
+  }, [shouldExpand]);
+
+  // ✅ ROBUST TEXT EXTRACTION
+  // Check 'content' first, then fall back to 'parts[0].text' (for streaming data)
+  const textContent = 
+    message.content ||
+    (message as any).text || 
+    ((message as any).parts && (message as any).parts.length > 0 && (message as any).parts[0]?.text ? (message as any).parts[0].text : "") || 
+    "";
 
   // Get user initials for fallback
   const getUserInitials = () => {
@@ -39,6 +57,31 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, highlighted }) =
     if (bytes < 1024) return bytes + ' B';
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  };
+
+  // Get preview text helper
+  const getPreviewText = (text: string): string => {
+    // If text is empty but attachments exist
+    if (!text.trim() && message.attachments && message.attachments.length > 0) {
+      return 'Attachment only';
+    }
+    
+    // Strip basic markdown symbols
+    let cleaned = text
+      .replace(/^#{1,6}\s+/gm, '') // Headers
+      .replace(/\*\*([^*]+)\*\*/g, '$1') // Bold
+      .replace(/\*([^*]+)\*/g, '$1') // Italic
+      .replace(/`([^`]+)`/g, '$1') // Inline code
+      .replace(/```[\s\S]*?```/g, '') // Code blocks
+      .replace(/\[([^\]]+)\]\([^\)]+\)/g, '$1') // Links
+      .trim();
+    
+    // Take first line or first 80 characters
+    const firstLine = cleaned.split('\n')[0];
+    const preview = firstLine.length <= 80 ? firstLine : firstLine.substring(0, 80);
+    
+    // Append "..." if truncated
+    return preview.length < cleaned.length || firstLine.length > 80 ? preview + '...' : preview;
   };
 
   const highlightClasses = highlighted ? 'ring-2 ring-amber-400 ring-offset-2 ring-offset-white dark:ring-offset-slate-900 shadow-lg' : '';
@@ -113,70 +156,107 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, highlighted }) =
             </div>
           )}
           
-          {message.isStreaming && !message.content ? (
+          {/* Text + Button Layout */}
+          {message.isStreaming && !textContent ? (
             <div className="animate-pulse flex space-x-2 py-2">
               <div className="h-2 w-2 bg-slate-400 rounded-full"></div>
               <div className="h-2 w-2 bg-slate-400 rounded-full"></div>
               <div className="h-2 w-2 bg-slate-400 rounded-full"></div>
             </div>
-          ) : message.content ? (
-            <div className={`prose dark:prose-invert max-w-none ${
-              isDrona 
-                ? 'prose-slate dark:prose-invert' 
-                : 'prose-invert'
-            } prose-p:leading-relaxed prose-headings:font-semibold prose-code:bg-slate-200 dark:prose-code:bg-slate-800 prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:text-sm prose-pre:bg-slate-900 dark:prose-pre:bg-slate-950 prose-pre:border prose-pre:border-slate-700 prose-pre:rounded-lg prose-pre:overflow-x-auto prose-ul:list-disc prose-ol:list-decimal prose-li:my-1`}>
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                components={{
-                  code({ node, inline, className, children, ...props }: any) {
-                    return inline ? (
-                      <code 
-                        className={`${className || ''} bg-slate-200 dark:bg-slate-800 px-1.5 py-0.5 rounded text-sm`} 
-                        {...props}
-                      >
-                        {children}
-                      </code>
-                    ) : (
-                      <code className={className} {...props}>
-                        {children}
-                      </code>
-                    );
-                  },
-                  pre({ node, className, children, ...props }: any) {
-                    return (
-                      <pre 
-                        className={`${className || ''} bg-slate-900 dark:bg-slate-950 border border-slate-700 rounded-lg p-4 overflow-x-auto`} 
-                        {...props}
-                      >
-                        {children}
-                      </pre>
-                    );
-                  },
-                  ul({ node, className, children, ...props }: any) {
-                    return (
-                      <ul className={`${className || ''} list-disc pl-6 my-2 space-y-1`} {...props}>
-                        {children}
-                      </ul>
-                    );
-                  },
-                  ol({ node, className, children, ...props }: any) {
-                    return (
-                      <ol className={`${className || ''} list-decimal pl-6 my-2 space-y-1`} {...props}>
-                        {children}
-                      </ol>
-                    );
-                  },
-                  li({ node, className, children, ...props }: any) {
-                    return (
-                      <li className={`${className || ''} my-1`} {...props}>
-                        {children}
-                      </li>
-                    );
-                  },
+          ) : textContent ? (
+            <div className="flex flex-row justify-between items-start gap-3 min-w-0">
+              {/* Message Content (Left) */}
+              <div className="flex-1 min-w-0">
+                {isExpanded ? (
+                  // Expanded full view
+                  <div className={`prose dark:prose-invert max-w-none ${
+                    isDrona 
+                      ? 'prose-slate dark:prose-invert' 
+                      : 'prose-invert'
+                  } prose-p:leading-relaxed prose-headings:font-semibold prose-code:bg-slate-200 dark:prose-code:bg-slate-800 prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:text-sm prose-pre:bg-slate-900 dark:prose-pre:bg-slate-950 prose-pre:border prose-pre:border-slate-700 prose-pre:rounded-lg prose-pre:overflow-x-auto prose-ul:list-disc prose-ol:list-decimal prose-li:my-1`}>
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        code({ node, inline, className, children, ...props }: any) {
+                          return inline ? (
+                            <code 
+                              className={`${className || ''} bg-slate-200 dark:bg-slate-800 px-1.5 py-0.5 rounded text-sm`} 
+                              {...props}
+                            >
+                              {children}
+                            </code>
+                          ) : (
+                            <code className={className} {...props}>
+                              {children}
+                            </code>
+                          );
+                        },
+                        pre({ node, className, children, ...props }: any) {
+                          return (
+                            <pre 
+                              className={`${className || ''} bg-slate-900 dark:bg-slate-950 border border-slate-700 rounded-lg p-4 overflow-x-auto`} 
+                              {...props}
+                            >
+                              {children}
+                            </pre>
+                          );
+                        },
+                        ul({ node, className, children, ...props }: any) {
+                          return (
+                            <ul className={`${className || ''} list-disc pl-6 my-2 space-y-1`} {...props}>
+                              {children}
+                            </ul>
+                          );
+                        },
+                        ol({ node, className, children, ...props }: any) {
+                          return (
+                            <ol className={`${className || ''} list-decimal pl-6 my-2 space-y-1`} {...props}>
+                              {children}
+                            </ol>
+                          );
+                        },
+                        li({ node, className, children, ...props }: any) {
+                          return (
+                            <li className={`${className || ''} my-1`} {...props}>
+                              {children}
+                            </li>
+                          );
+                        },
+                      }}
+                    >
+                      {textContent}
+                    </ReactMarkdown>
+                  </div>
+                ) : (
+                  // Collapsed preview view
+                  <p 
+                    onClick={() => setIsExpanded(true)}
+                    className={`text-sm opacity-90 truncate italic cursor-pointer ${isDrona ? 'text-slate-600 dark:text-slate-400' : 'text-white/80'}`}
+                  >
+                    {getPreviewText(textContent)}
+                  </p>
+                )}
+              </div>
+
+              {/* Toggle Button (Right) */}
+              <button 
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setIsExpanded(!isExpanded);
                 }}
+                className="shrink-0 mt-0.5 opacity-70 hover:opacity-100 transition-opacity p-1 rounded-full hover:bg-black/10 dark:hover:bg-white/10"
+                aria-label={isExpanded ? "Collapse message" : "Expand message"}
               >
-                {message.content}
-              </ReactMarkdown>
+                {isExpanded ? (
+                  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={isDrona ? 'text-slate-600 dark:text-slate-400' : 'text-white/80'}>
+                    <polyline points="18 15 12 9 6 15"></polyline>
+                  </svg>
+                ) : (
+                  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={isDrona ? 'text-slate-600 dark:text-slate-400' : 'text-white/80'}>
+                    <polyline points="6 9 12 15 18 9"></polyline>
+                  </svg>
+                )}
+              </button>
             </div>
           ) : null}
           <div className={`text-[10px] mt-2 opacity-60 ${isDrona ? 'text-left' : 'text-right'}`}>

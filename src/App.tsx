@@ -57,10 +57,12 @@ const App: React.FC = () => {
   const [isInteractionMode, setIsInteractionMode] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isListening, setIsListening] = useState(false);
+  const [isInteractionStreaming, setIsInteractionStreaming] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isPricingOpen, setIsPricingOpen] = useState(false);
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [areAllExpanded, setAreAllExpanded] = useState(true);
 
   type InteractionStatus = "idle" | "requesting_permissions" | "connecting" | "active" | "reconnecting" | "error";
   const [interactionStatus, setInteractionStatus] = useState<InteractionStatus>("idle");
@@ -85,6 +87,10 @@ const App: React.FC = () => {
   const currentOutputTransRef = useRef('');
   const lastUserMsgIdRef = useRef<string | null>(null);
   const lastDronaMsgIdRef = useRef<string | null>(null);
+  
+  // Transcript timeout safety
+  const transcriptTimeoutRef = useRef<number | null>(null);
+  const firstTranscriptTimeRef = useRef<number | null>(null);
   const sessionsRef = useRef<ChatSession[]>([]);
   const activeSessionIdRef = useRef<string>('');
 
@@ -109,30 +115,34 @@ const App: React.FC = () => {
     }
   }, [isDarkMode]);
 
+  // Extract session loading logic into a reusable function
+  const refreshSessions = useCallback(async () => {
+    if (!user) return;
+    try {
+      const data = await dbService.getSessions(user.id);
+      const parsed = data.map((s: any) => ({
+        ...s,
+        createdAt: new Date(s.createdAt),
+        messages: s.messages.map((m: any) => ({
+          ...m,
+          timestamp: new Date(m.timestamp)
+        }))
+      }));
+      setSessions(parsed);
+    } catch (e) {
+      console.error('Error refreshing sessions:', e);
+    }
+  }, [user]);
+
   useEffect(() => {
     if (user) {
       setIsLoading(true);
       dbService.syncUser(user)
-        .then(() => dbService.getSessions(user.id))
-        .then(data => {
-        const parsed = data.map((s: any) => ({
-          ...s,
-          createdAt: new Date(s.createdAt),
-          messages: s.messages.map((m: any) => ({
-            ...m,
-            timestamp: new Date(m.timestamp)
-          }))
-        }));
-        setSessions(parsed);
-        })
-        .catch(error => {
-          console.error('Error syncing user or loading sessions:', error);
-        })
-        .finally(() => {
-        setIsLoading(false);
-      });
+        .then(() => refreshSessions())
+        .catch(error => console.error('Error syncing user:', error))
+        .finally(() => setIsLoading(false));
     }
-  }, [user]);
+  }, [user, refreshSessions]);
 
   useEffect(() => {
     localStorage.setItem('drona_active_id', activeSessionId);
@@ -300,26 +310,15 @@ const App: React.FC = () => {
     processor.onaudioprocess = (e) => {
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // Gating: only send when active and session exists
-      if (interactionStatus !== "active") return;
-      if (!liveSessionRef.current) return;
-
-      // Convert Float32 to Int16 PCM
-      const pcm16 = floatTo16BitPCM(inputData);
-      // Create a new ArrayBuffer to avoid type issues
-      const buffer = pcm16.buffer.slice(pcm16.byteOffset, pcm16.byteOffset + pcm16.byteLength) as ArrayBuffer;
-      const pcmBlob = new Blob([buffer], { type: "audio/pcm;rate=16000" });
-
-      // One-time debug log (dev only)
-      if (!debugLogged) {
-        console.log("[MIC] sending pcm bytes=", pcm16.byteLength);
-        debugLogged = true;
-      }
-
-      try {
-        liveSessionRef.current.sendRealtimeInput({ media: pcmBlob });
-      } catch {
-        // swallow — reconnect logic will recover
+      // Use the helper for reliable Float32 -> Int16 conversion
+      const pcmBlob = createBlob(inputData);
+      
+      if (liveSessionRef.current) {
+        try {
+          liveSessionRef.current.sendRealtimeInput({ media: pcmBlob });
+        } catch (e) {
+          console.error("Error sending audio frame:", e);
+        }
       }
     };
 
@@ -374,54 +373,24 @@ const App: React.FC = () => {
           }
 
           if (message.serverContent?.inputTranscription) {
+            const text = message.serverContent.inputTranscription.text;
+            console.log("📝 [Front] Rx User Trans:", text);
             setIsListening(true);
-            currentInputTransRef.current +=
-              message.serverContent.inputTranscription.text;
+            currentInputTransRef.current += text;
             syncInteractionModeTranscription();
           }
 
           if (message.serverContent?.outputTranscription) {
-            currentOutputTransRef.current +=
-              message.serverContent.outputTranscription.text;
+            const text = message.serverContent.outputTranscription.text;
+            console.log("📝 [Front] Rx Drona Trans:", text);
+            currentOutputTransRef.current += text;
             syncInteractionModeTranscription();
           }
 
           if (message.serverContent?.turnComplete) {
-            try {
-              if (activeSessionIdRef.current) {
-                if (lastUserMsgIdRef.current && currentInputTransRef.current.trim()) {
-                  await dbService.saveMessage(
-                    {
-                      id: lastUserMsgIdRef.current,
-                      role: Role.USER,
-                      content: currentInputTransRef.current.trim(),
-                      timestamp: new Date()
-                    },
-                    activeSessionIdRef.current
-                  );
-                }
-
-                if (lastDronaMsgIdRef.current && currentOutputTransRef.current.trim()) {
-                  await dbService.saveMessage(
-                    {
-                      id: lastDronaMsgIdRef.current,
-                      role: Role.DRONA,
-                      content: currentOutputTransRef.current.trim(),
-                      timestamp: new Date()
-                    },
-                    activeSessionIdRef.current
-                  );
-                }
-              }
-            } catch (e) {
-              console.error('Error saving interaction mode messages:', e);
-            }
-
-            setIsListening(false);
-            currentInputTransRef.current = '';
-            currentOutputTransRef.current = '';
-            lastUserMsgIdRef.current = null;
-            lastDronaMsgIdRef.current = null;
+            console.log("🏁 [Front] Turn Complete. Triggering save...");
+            // Turn complete: finalize transcripts and persist to DB
+            await finalizeTranscriptTurn(false);
           }
   }, []);
 
@@ -661,36 +630,165 @@ const App: React.FC = () => {
     }
   };
 
+  // Finalize transcript turn: mark messages as complete, persist to DB, clear refs
+  const finalizeTranscriptTurn = async (isTimeout = false) => {
+    console.log("💾 [Front] Finalizing Turn. Session:", activeSessionIdRef.current);
+    console.log("   > User Buffer:", currentInputTransRef.current);
+    console.log("   > Drona Buffer:", currentOutputTransRef.current);
+    
+    // Clear timeout if it exists
+    if (transcriptTimeoutRef.current) {
+      window.clearTimeout(transcriptTimeoutRef.current);
+      transcriptTimeoutRef.current = null;
+    }
+
+    try {
+      const currentSessionId = activeSessionIdRef.current;
+      
+      if (currentSessionId) {
+        // --- Persist to DB: Save User Message ---
+        if (currentInputTransRef.current && currentInputTransRef.current.trim()) {
+          const userMsgId = lastUserMsgIdRef.current || Date.now().toString() + '-int-u';
+          console.log("   > Saving User Message to DB...");
+          try {
+            await dbService.saveMessage({
+              id: userMsgId,
+              role: Role.USER,
+              content: currentInputTransRef.current.trim(),
+              timestamp: new Date()
+            }, currentSessionId);
+            console.log("   ✅ User Message Saved!");
+            
+            // Ensure the ID is set for state updates
+            if (!lastUserMsgIdRef.current) {
+              lastUserMsgIdRef.current = userMsgId;
+            }
+          } catch (e) {
+            console.error("   ❌ User Save FAILED:", e);
+          }
+        } else {
+          console.log("   ⚠️ Skipping user message save - no content");
+        }
+
+        // --- Persist to DB: Save Drona Message ---
+        if (currentOutputTransRef.current && currentOutputTransRef.current.trim()) {
+          const dronaMsgId = lastDronaMsgIdRef.current || (Date.now() + 1).toString() + '-int-d';
+          console.log("   > Saving Drona Message to DB...");
+          try {
+            await dbService.saveMessage({
+              id: dronaMsgId,
+              role: Role.DRONA,
+              content: currentOutputTransRef.current.trim(),
+              timestamp: new Date()
+            }, currentSessionId);
+            console.log("   ✅ Drona Message Saved!");
+            
+            // Ensure the ID is set for state updates
+            if (!lastDronaMsgIdRef.current) {
+              lastDronaMsgIdRef.current = dronaMsgId;
+            }
+          } catch (e) {
+            console.error("   ❌ Drona Save FAILED:", e);
+          }
+        } else {
+          console.log("   ⚠️ Skipping drona message save - no content");
+        }
+
+        // Finalize streaming state: mark messages as complete (remove isStreaming flag)
+        setSessions(prev =>
+          prev.map(s => {
+            if (s.id !== currentSessionId) return s;
+            
+            let updatedMessages = s.messages.map(m => {
+              if (m.id === lastUserMsgIdRef.current || m.id === lastDronaMsgIdRef.current) {
+                return { ...m, isStreaming: false };
+              }
+              return m;
+            });
+
+            // Add timeout warning message if needed
+            if (isTimeout && (lastUserMsgIdRef.current || lastDronaMsgIdRef.current)) {
+              updatedMessages.push({
+                id: Date.now().toString() + '-timeout',
+                role: Role.DRONA,
+                content: '⚠️ Interaction timed out — please retry.',
+                timestamp: new Date(),
+                isStreaming: false
+              });
+            }
+
+            return {
+              ...s,
+              messages: updatedMessages
+            };
+          })
+        );
+      }
+    } catch (e) {
+      console.error('Error finalizing interaction mode messages:', e);
+    }
+
+    // Clear streaming state and refs
+    setIsInteractionStreaming(false);
+    setIsListening(false);
+    currentInputTransRef.current = '';
+    currentOutputTransRef.current = '';
+    lastUserMsgIdRef.current = null;
+    lastDronaMsgIdRef.current = null;
+    firstTranscriptTimeRef.current = null;
+  };
+
+  // Streaming message update: update transcript text in real-time
   const syncInteractionModeTranscription = () => {
+    // Track first transcript event for timeout safety
+    if (!firstTranscriptTimeRef.current && 
+        (currentInputTransRef.current.trim() || currentOutputTransRef.current.trim())) {
+      firstTranscriptTimeRef.current = Date.now();
+      setIsInteractionStreaming(true);
+      console.log("[FRONTEND] 🚀 Starting transcript streaming");
+      
+      // Set up 12-second timeout safety
+      transcriptTimeoutRef.current = window.setTimeout(() => {
+        console.warn('Transcript timeout: finalizing turn after 12 seconds');
+        finalizeTranscriptTurn(true);
+      }, 12000);
+    }
+
     setSessions(prev =>
       prev.map(s => {
         if (s.id !== activeSessionIdRef.current) return s;
 
         let newMessages = [...s.messages];
 
+        // Streaming user message update - overwrite existing message or create new
         if (currentInputTransRef.current) {
           if (!lastUserMsgIdRef.current) {
             lastUserMsgIdRef.current =
               Date.now().toString() + '-int-u';
+            console.log("[FRONTEND] ➕ Creating new user message in UI:", lastUserMsgIdRef.current);
             newMessages.push({
               id: lastUserMsgIdRef.current,
               role: Role.USER,
               content: currentInputTransRef.current,
-              timestamp: new Date()
+              timestamp: new Date(),
+              isStreaming: true
             });
           } else {
+            console.log("[FRONTEND] 🔄 Updating existing user message:", lastUserMsgIdRef.current);
             newMessages = newMessages.map(m =>
               m.id === lastUserMsgIdRef.current
-                ? { ...m, content: currentInputTransRef.current }
+                ? { ...m, content: currentInputTransRef.current, isStreaming: true }
                 : m
             );
           }
         }
 
+        // Streaming drona message update - overwrite existing message or create new
         if (currentOutputTransRef.current) {
           if (!lastDronaMsgIdRef.current) {
             lastDronaMsgIdRef.current =
               Date.now().toString() + '-int-d';
+            console.log("[FRONTEND] ➕ Creating new drona message in UI:", lastDronaMsgIdRef.current);
             newMessages.push({
               id: lastDronaMsgIdRef.current,
               role: Role.DRONA,
@@ -699,9 +797,10 @@ const App: React.FC = () => {
               isStreaming: true
             });
           } else {
+            console.log("[FRONTEND] 🔄 Updating existing drona message:", lastDronaMsgIdRef.current);
             newMessages = newMessages.map(m =>
               m.id === lastDronaMsgIdRef.current
-                ? { ...m, content: currentOutputTransRef.current }
+                ? { ...m, content: currentOutputTransRef.current, isStreaming: true }
                 : m
             );
           }
@@ -731,7 +830,7 @@ const App: React.FC = () => {
     );
   };
 
-  const hardStopInteractionMode = () => {
+  const hardStopInteractionMode = async () => {
     stopRequestedRef.current = true;
     setInteractionStatus("idle");
     setIsInteractionMode(false);
@@ -740,10 +839,22 @@ const App: React.FC = () => {
     setIsLoading(false);
     stopAllAudio();
 
+    // Finalize any pending transcripts before stopping
+    if (isInteractionStreaming) {
+      await finalizeTranscriptTurn(false);
+    }
+
     if (reconnectTimerRef.current) {
       window.clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
     }
+    
+    // Clear transcript timeout if it exists
+    if (transcriptTimeoutRef.current) {
+      window.clearTimeout(transcriptTimeoutRef.current);
+      transcriptTimeoutRef.current = null;
+    }
+    
     reconnectingRef.current = false;
     reconnectAttemptsRef.current = 0;
 
@@ -788,6 +899,9 @@ const App: React.FC = () => {
       outputAudioContextRef.current.close();
       outputAudioContextRef.current = null;
     }
+
+    // Refresh UI from DB to show latest transcripts
+    await refreshSessions();
   };
 
   const handleSend = async (text: string, attachments?: any[]) => {
@@ -1060,6 +1174,26 @@ const App: React.FC = () => {
               </div>
             </div>
 
+            {/* Centered Expand/Collapse All Toggle */}
+            <div className="absolute left-1/2 top-1/2 transform -translate-x-1/2 -translate-y-1/2 hidden md:block z-20">
+              <button
+                onClick={() => setAreAllExpanded(!areAllExpanded)}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-xs font-medium text-slate-600 dark:text-slate-300 transition-colors border border-slate-200 dark:border-slate-700 shadow-sm"
+              >
+                {areAllExpanded ? (
+                  <>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m18 15-6-6-6 6"/></svg>
+                    <span>Collapse All</span>
+                  </>
+                ) : (
+                  <>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                    <span>Expand All</span>
+                  </>
+                )}
+              </button>
+            </div>
+
             <div className="flex items-center gap-4">
               <button
                 onClick={() => setIsDarkMode(!isDarkMode)}
@@ -1151,6 +1285,7 @@ const App: React.FC = () => {
                     key={msg.id}
                     message={msg}
                     highlighted={highlightedMessageId === msg.id}
+                    shouldExpand={areAllExpanded}
                   />
                 ))
               )}
@@ -1161,7 +1296,7 @@ const App: React.FC = () => {
             onSend={handleSend}
             onVoiceClick={startInteractionMode}
             isVoiceActive={isInteractionMode}
-            disabled={isLoading}
+            disabled={isLoading || isInteractionStreaming}
           />
         </div>
 

@@ -306,7 +306,7 @@ app.use(express.json());
 
 const PORT = 3001;
 const CHAT_MODEL = "gemini-2.5-flash";
-const LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-09-2025";
+const LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -873,6 +873,22 @@ wss.on('connection', async (ws: WebSocket) => {
       model: LIVE_MODEL,
       callbacks: {
         onmessage: (msg: any) => {
+          // Debug Logging: Inspect EXACTLY what Google is sending back
+          if (msg.serverContent) {
+            if (msg.serverContent.inputTranscription) {
+              console.log("[LIVE] 🎤 User Text:", msg.serverContent.inputTranscription.text);
+            }
+            if (msg.serverContent.outputTranscription) {
+              console.log("[LIVE] 🤖 AI Text:", msg.serverContent.outputTranscription.text);
+            }
+            if (msg.serverContent.turnComplete) {
+              console.log("[LIVE] 🔄 Turn Complete");
+            }
+          } else {
+            // Log other event types just to verify connection life
+            // console.log("[LIVE] Other Event:", Object.keys(msg));
+          }
+          
           if (msg?.error) console.error("[LIVE] msg.error:", msg.error);
           ws.send(JSON.stringify(msg));
         },
@@ -885,10 +901,15 @@ wss.on('connection', async (ws: WebSocket) => {
           try { ws.close(); } catch {}
         }
       },
-      config: { 
+      config: {
         systemInstruction: DRONA_INTERACTION_PROMPT,
-        responseModalities: [Modality.AUDIO], 
-        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } } 
+        responseModalities: [Modality.AUDIO],
+        speechConfig: {
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
+        },
+        // Transcription enabled at root level for 12-2025 model
+        inputAudioTranscription: {},
+        outputAudioTranscription: {}
       }
     });
   } catch (e) {
