@@ -18,6 +18,7 @@ import {
 import { dbService } from '../services/dbService';
 import PricingModal from '../components/PricingModal';
 import SearchModal from '../components/SearchModal';
+import { useContextRecorder } from './hooks/useContextRecorder';
 
 const LandingPage = () => (
   <div className="flex flex-col items-center justify-center h-screen bg-slate-900 text-white p-6 text-center">
@@ -196,6 +197,16 @@ const App: React.FC = () => {
     scrollToBottom();
   }, [activeSession?.messages, scrollToBottom]);
 
+  // ✅ VISUAL AUDIT TRAIL
+  // Silently watches for screen changes when interaction mode is active
+  useContextRecorder({
+    isActive: isInteractionMode,
+    videoRef: videoRef,
+    sessionId: activeSessionId,
+    userId: user?.id,     
+    getToken: getToken
+  });
+
   // 4. Helper Functions
   const createNewSession = () => {
     const newId = Date.now().toString();
@@ -358,10 +369,12 @@ const App: React.FC = () => {
             const source = ctx.createBufferSource();
             source.buffer = audioBuffer;
             source.connect(ctx.destination);
+            // Import and integrate the useContextRecorder hook
             source.addEventListener('ended', () => {
               sourcesRef.current.delete(source);
               if (sourcesRef.current.size === 0) setIsSpeaking(false);
             });
+
             source.start(nextStartTimeRef.current);
             nextStartTimeRef.current += audioBuffer.duration;
             sourcesRef.current.add(source);
@@ -373,6 +386,14 @@ const App: React.FC = () => {
           }
 
           if (message.serverContent?.inputTranscription) {
+            useContextRecorder({
+              isActive: isInteractionMode,
+              videoRef: videoRef,
+              sessionId: activeSessionId,
+              userId: user?.id,
+              getToken: getToken
+            });
+
             const text = message.serverContent.inputTranscription.text;
             console.log("📝 [Front] Rx User Trans:", text);
             setIsListening(true);

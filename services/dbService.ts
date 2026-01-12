@@ -1,4 +1,19 @@
+import { createClient } from '@supabase/supabase-js';
+
 const API_URL = 'http://localhost:3001/api';
+
+// Supabase client for direct database operations
+const supabaseUrl = (import.meta as any).env?.VITE_SUPABASE_URL || '';
+const supabaseAnonKey = (import.meta as any).env?.VITE_SUPABASE_ANON_KEY || '';
+const supabase = supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null;
+
+export interface AuditLogEntry {
+  session_id: string;
+  // user_id?: string | null;
+  image_path: string;
+  diff_percentage: number;
+  created_at: string; // ISO string
+}
 
 export const dbService = {
   async syncUser(user: any) {
@@ -47,5 +62,22 @@ export const dbService = {
 
   async deleteSession(sessionId: string) {
     await fetch(`${API_URL}/sessions/${sessionId}`, { method: 'DELETE' });
+  },
+
+  async saveAuditLog(entry: AuditLogEntry) {
+    if (!supabase) {
+      throw new Error('Supabase client not initialized. Please set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY environment variables.');
+    }
+    
+    const { data, error } = await supabase
+      .from('audit_logs')
+      .insert([entry]);
+
+    if (error) {
+      console.error('Error saving audit log:', error);
+      throw error;
+    }
+    
+    return data;
   }
 };
