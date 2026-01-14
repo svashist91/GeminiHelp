@@ -1,5 +1,4 @@
 import { useEffect, useRef } from 'react';
-import { dbService } from '../../services/dbService';
 import { createClient } from '@supabase/supabase-js';
 
 const supabaseUrl = (import.meta as any).env?.VITE_SUPABASE_URL || '';
@@ -157,7 +156,13 @@ export const useContextRecorder = ({ isActive, videoRef, sessionId, userId, getT
           } 
 
           // Create an Authenticated Client for this specific request
+          // Add auth config to avoid "Multiple GoTrueClient instances" warning
           const authSupabase = createClient(supabaseUrl, supabaseKey, {
+            auth: {
+              persistSession: false,
+              autoRefreshToken: false,
+              detectSessionInUrl: false
+            },
             global: { headers: { Authorization: `Bearer ${token}` } }
           });
 
@@ -192,13 +197,53 @@ export const useContextRecorder = ({ isActive, videoRef, sessionId, userId, getT
               console.log('[Recorder] ✅ Upload Success!');
               
               // --- DATABASE LOG ---
-              await dbService.saveAuditLog({
+              const auditPayload = {
                 session_id: sessionId,
-                user_id: userId,
+                user_id: userId as string,
                 image_path: data.path,
                 diff_percentage: diff,
                 created_at: new Date().toISOString()
-              });
+              };
+
+              console.log("[Recorder] 🧾 Audit payload", auditPayload);
+
+              const { data: auditRow, error: auditErr } = await authSupabase
+                .from('audit_logs')
+                .insert(auditPayload)
+                .select('id')
+                .single();
+
+              if (auditErr) {
+                console.error('[Recorder] ❌ Audit insert failed:', auditErr);
+                // Don't crash the interval, just log and continue
+              } else if (auditRow?.id) {
+                console.log(`[Recorder] 📝 Audit row created: ${auditRow.id}`);
+                
+                // --- TRIGGER AI ANALYSIS ---
+                console.log('[Recorder] 🧠 Calling analyze-screenshot...');
+                try {
+                  const response = await fetch(`${supabaseUrl}/functions/v1/analyze-screenshot`, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'Authorization': `Bearer ${token}`
+                    },
+                    body: JSON.stringify({
+                      record_id: auditRow.id,
+                      image_path: data.path
+                    })
+                  });
+
+                  if (!response.ok) {
+                    const errorText = await response.text();
+                    console.error('[Recorder] 🧠 Screenshot analysis failed:', response.status, errorText);
+                  } else {
+                    console.log('[Recorder] 🧠 Screenshot analyzed');
+                  }
+                } catch (err) {
+                  console.error('[Recorder] 🧠 Screenshot analysis error:', err);
+                }
+              }
             }
           }
           lastFrameDataRef.current = frameData;
