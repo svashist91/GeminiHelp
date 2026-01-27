@@ -15,10 +15,18 @@ import {
   useUser,
   useAuth
 } from "@clerk/clerk-react";
-import { dbService } from '../services/dbService';
+import { dbService, getProjectContext } from '../services/dbService';
+import { applyProjectContextPatch } from '../services/contextApi';
+import { Patch, PlanContext, createEmptyPlanContext, validatePlanContext } from '../shared/contextSchema';
 import PricingModal from '../components/PricingModal';
 import SearchModal from '../components/SearchModal';
 import { useContextRecorder } from './hooks/useContextRecorder';
+
+type Project = {
+  id: string;
+  name: string;
+  createdAt: string;
+};
 
 const LandingPage = () => (
   <div className="flex flex-col items-center justify-center h-screen bg-slate-900 text-white p-6 text-center">
@@ -53,6 +61,14 @@ const App: React.FC = () => {
     const lastActive = localStorage.getItem('drona_active_id');
     return lastActive || '';
   });
+
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(() => {
+    const v = localStorage.getItem("drona_active_project_id");
+    return v ? v : null;
+  });
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [projectContext, setProjectContext] = useState<PlanContext | null>(null);
+  const [isApplyingPatch, setIsApplyingPatch] = useState(false);
 
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isInteractionMode, setIsInteractionMode] = useState(false);
@@ -135,19 +151,45 @@ const App: React.FC = () => {
     }
   }, [user]);
 
+  const refreshProjects = useCallback(async () => {
+    if (!user) return;
+    try {
+      const rows = await dbService.getProjects(user.id);
+      const normalized: Project[] = (rows ?? []).map((p: any) => ({
+        id: p.id,
+        name: p.name,
+        createdAt: p.created_at ?? p.createdAt ?? new Date().toISOString(),
+      }));
+      setProjects(normalized);
+    } catch (e) {
+      console.error('Error refreshing projects:', e);
+    }
+  }, [user]);
+
   useEffect(() => {
     if (user) {
       setIsLoading(true);
       dbService.syncUser(user)
-        .then(() => refreshSessions())
+        .then(async () => {
+          await refreshProjects();
+          await refreshSessions();
+        })
         .catch(error => console.error('Error syncing user:', error))
         .finally(() => setIsLoading(false));
     }
-  }, [user, refreshSessions]);
+  }, [user, refreshProjects, refreshSessions]);
 
   useEffect(() => {
     localStorage.setItem('drona_active_id', activeSessionId);
   }, [activeSessionId]);
+
+  useEffect(() => {
+    if (activeProjectId) {
+      localStorage.setItem("drona_active_project_id", activeProjectId);
+    } else {
+      localStorage.removeItem("drona_active_project_id");
+    }
+  }, [activeProjectId]);
 
   useEffect(() => {
     sessionsRef.current = sessions;
@@ -186,6 +228,18 @@ const App: React.FC = () => {
   }, []);
 
   const activeSession = sessions.find(s => s.id === activeSessionId) || null;
+  const filteredSessions = activeProjectId
+    ? sessions.filter(session => session.project_id === activeProjectId)
+    : sessions;
+  const activeProject = projects.find(p => p.id === activeProjectId) || null;
+
+  const formatShortDate = (d: Date) =>
+    d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+
+  const handleCreateChatInProject = useCallback(() => {
+    if (!activeProjectId) return;
+    createNewSession();
+  }, [activeProjectId]);
 
   const scrollToBottom = useCallback(() => {
     if (scrollRef.current) {
@@ -215,6 +269,7 @@ const App: React.FC = () => {
       title: 'New Session',
       messages: [],
       createdAt: new Date(),
+      project_id: activeProjectId ?? null,
     };
   
     setSessions(prev => [newSession, ...prev]);
@@ -222,7 +277,7 @@ const App: React.FC = () => {
   
     // Persist immediately so it survives refresh
     if (user) {
-      dbService.saveSession(newSession, user.id);
+      dbService.saveSession(newSession, user.id, activeProjectId ?? null);
     }
   
     // If you have activeSessionIdRef, keep it synced
@@ -234,12 +289,140 @@ const App: React.FC = () => {
   };
   
 
-  const deleteSession = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    dbService.deleteSession(id);
-    setSessions(prev => prev.filter(s => s.id !== id));
-    if (activeSessionId === id) setActiveSessionId('');
+  const createProject = useCallback(async (name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    if (!user) return;
+
+    try {
+      const created = await dbService.createProject(user.id, trimmed, null);
+      const normalized: Project = {
+        id: created.id,
+        name: created.name,
+        createdAt: created.created_at ?? new Date().toISOString(),
+      };
+
+      setProjects(prev => [normalized, ...prev]);
+      setActiveProjectId(normalized.id);
+      setActiveSessionId("");
+    } catch (e) {
+      console.error('Error creating project:', e);
+      alert('Unable to create project. Please try again.');
+    }
+  }, [user]);
+
+  const handleDeleteProject = async (projectId: string) => {
+    try {
+      await dbService.deleteProject(projectId);
+      setProjects(prev => prev.filter(p => p.id !== projectId));
+      setSessions(prev => prev.filter(s => s.project_id !== projectId));
+      if (activeProjectId === projectId) {
+        setActiveProjectId(null);
+        setActiveSessionId('');
+      }
+    } catch (e) {
+      console.error('Error deleting project:', e);
+    }
   };
+
+  const handleDeleteSessionConfirmed = async (sessionId: string) => {
+    try {
+      await dbService.deleteSession(sessionId);
+      setSessions(prev => prev.filter(s => s.id !== sessionId));
+      if (activeSessionId === sessionId) setActiveSessionId('');
+    } catch (e) {
+      console.error('Error deleting session:', e);
+    }
+  };
+
+  const handleSelectProject = useCallback((id: string) => {
+    setActiveProjectId(id);
+    // Clear the current chat when switching project context
+    setActiveSessionId('');
+    void (async () => {
+      try {
+        const ctx = await getProjectContext(id);
+        console.log('[CONTEXT] project_context row:', ctx);
+        console.log('[CONTEXT] context_json:', ctx.context_json);
+        const next = ctx?.context_json;
+        if (next && validatePlanContext(next)) {
+          setProjectContext(next);
+        } else {
+          console.warn('[CONTEXT] Invalid or missing context_json; using empty context');
+          setProjectContext(createEmptyPlanContext());
+        }
+      } catch (e) {
+        console.error('[CONTEXT] Failed to load project context', e);
+      }
+    })();
+  }, []);
+
+  const handleApplyTestStep = useCallback(async () => {
+    if (!activeProjectId) return;
+    const baseContext = projectContext ?? createEmptyPlanContext();
+    const baseVersion = baseContext.version || 1;
+    const stepId = `step_${Date.now().toString()}`;
+    const patch: Patch = {
+      patch_id: `patch_${Date.now().toString()}`,
+      ops: [
+        {
+          op: "upsert_step",
+          step: {
+            id: stepId,
+            title: `Test step ${new Date().toLocaleTimeString()}`,
+            status: "todo",
+            parent: null,
+            children: [],
+            depends_on: []
+          }
+        },
+        {
+          op: "add_root_step",
+          id: stepId
+        }
+      ]
+    };
+
+    setIsApplyingPatch(true);
+    console.groupCollapsed('[UI] handleApplyTestStep');
+    console.log('activeProjectId', activeProjectId);
+    console.log('baseContext.version', baseContext.version);
+    console.log('baseVersion (request)', baseVersion);
+    console.log('patch_id', patch.patch_id);
+    console.log('ops', patch.ops.map(op => op.op));
+    console.log('patch', patch);
+    try {
+      const res = await applyProjectContextPatch({
+        projectId: activeProjectId,
+        baseVersion,
+        patch,
+        getToken
+      });
+
+      console.log('response', res);
+
+      if (res.ok) {
+        setProjectContext(res.context);
+        return;
+      }
+
+      if ('error' in res && res.error === "version_conflict" && 'context' in res) {
+        setProjectContext(res.context as PlanContext);
+        return;
+      }
+
+      console.error('[context-apply] failed:', res);
+      const errorMessage = [
+        `error: ${(res as any).error ?? 'unknown'}`,
+        `message: ${(res as any).message ?? 'n/a'}`,
+        `status: ${(res as any).status ?? 'n/a'}`
+      ].join('\n');
+      alert(errorMessage);
+    } finally {
+      setIsApplyingPatch(false);
+      console.groupEnd();
+    }
+  }, [activeProjectId, projectContext, getToken]);
 
   const handleSelectSession = async (id: string) => {
     setActiveSessionId(id);
@@ -835,14 +1018,17 @@ const App: React.FC = () => {
 
         // Persist title update to DB once we have real user text
         if (user && s.title === 'New Session' && title !== 'New Session') {
+          const pid = s.project_id ?? activeProjectId ?? null;
           dbService.saveSession(
             {
               id: s.id,
               title,
               createdAt: s.createdAt,
-              messages: []
+              messages: [],
+              project_id: pid
             } as any,
-            user.id
+            user.id,
+            pid
           );
         }
 
@@ -966,6 +1152,7 @@ const App: React.FC = () => {
         title: text.slice(0, 30) + (text.length > 30 ? '...' : ''),
         messages: [],
         createdAt: new Date(),
+        project_id: activeProjectId ?? null,
       };
       setSessions(prev => [newSession, ...prev]);
 
@@ -980,7 +1167,7 @@ const App: React.FC = () => {
       dbService.saveMessage(userMsg, currentId);
 
       // Save the new session to the database
-      dbService.saveSession(newSession, user!.id);
+      dbService.saveSession(newSession, user!.id, activeProjectId ?? null);
 
       setActiveSessionId(newId);
     } else {
@@ -1029,14 +1216,18 @@ const App: React.FC = () => {
 
       // Only update DB if title is still default / empty
       if (!session || session.title === 'New Session') {
+        const pid =
+          (sessionsRef.current.find(s => s.id === currentId)?.project_id ?? activeProjectId ?? null);
         dbService.saveSession(
           {
             id: currentId,
             title: newTitle,
             createdAt: session?.createdAt ?? new Date(),
-            messages: [] // ok if dbService ignores this field
+            messages: [], // ok if dbService ignores this field
+            project_id: pid
           } as any,
-          user.id
+          user.id,
+          pid
         );
       }
     }
@@ -1134,11 +1325,17 @@ const App: React.FC = () => {
         />
 
         <Sidebar
-          sessions={sessions}
+          userId={user?.id}
+          projects={projects}
+          onCreateProject={createProject}
+          sessions={filteredSessions}
           activeSessionId={activeSessionId}
+          activeProjectId={activeProjectId}
+          onSelectProject={handleSelectProject}
           onSelectSession={handleSelectSession}
           onNewChat={createNewSession}
-          onDeleteSession={deleteSession}
+          onDeleteProject={handleDeleteProject}
+          onRequestDeleteSession={handleDeleteSessionConfirmed}
           isOpen={isSidebarOpen}
           onToggle={() => setIsSidebarOpen(!isSidebarOpen)}
           onOpenPricing={() => setIsPricingOpen(true)}
@@ -1216,6 +1413,16 @@ const App: React.FC = () => {
             </div>
 
             <div className="flex items-center gap-4">
+              {activeProjectId && (
+                <button
+                  onClick={handleApplyTestStep}
+                  disabled={isApplyingPatch}
+                  className="px-3 py-1 rounded-lg border border-slate-200 dark:border-slate-700 text-sm text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="Add test step"
+                >
+                  {isApplyingPatch ? "Working..." : "➕ Test Step"}
+                </button>
+              )}
               <button
                 onClick={() => setIsDarkMode(!isDarkMode)}
                 className="p-2 rounded-lg bg-slate-200 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-300 dark:hover:bg-slate-700 transition-all"
@@ -1280,45 +1487,106 @@ const App: React.FC = () => {
             ref={scrollRef}
           >
             <div className="max-w-4xl mx-auto min-h-full flex flex-col">
-              {!activeSession ||
-              activeSession.messages.length === 0 ? (
-                <div className="flex-1 flex flex-col items-center justify-center text-center space-y-8 animate-in fade-in zoom-in duration-700">
-                  <div className="relative">
-                    <div className="absolute inset-0 bg-indigo-500 blur-3xl opacity-10 rounded-full animate-pulse"></div>
-                    <div className="w-20 h-20 bg-gradient-to-br from-indigo-500 to-emerald-500 rounded-2xl flex items-center justify-center shadow-2xl transform rotate-12">
-                      <span className="text-3xl font-bold text-white serif italic">
-                        D
-                      </span>
-                    </div>
-                  </div>
+              {!activeProjectId ? (
+                <div className="flex-1 flex flex-col items-center justify-center text-center space-y-4 animate-in fade-in zoom-in duration-700">
                   <div className="max-w-md px-6">
-                    <h2 className="text-2xl font-bold text-slate-900 dark:text-white serif mb-3 italic">
-                      Welcome to the Arena of Wisdom
+                    <h2 className="text-2xl font-bold text-slate-900 dark:text-white serif mb-2 italic">
+                      Create or select a project
                     </h2>
                     <p className="text-slate-600 dark:text-slate-400 leading-relaxed text-sm">
-                      I am Drona, your master AI mentor. Start a conversation or hit the icon to begin your real-time <b>Interaction Mode</b> session.
+                      Projects are the top-level workspace. Create a project to start chatting.
                     </p>
                   </div>
                 </div>
+              ) : (!activeSessionId || !activeSession) ? (
+                <div className="w-full pt-6">
+                  <button
+                    onClick={handleCreateChatInProject}
+                    className="w-full flex items-center gap-4 px-6 py-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm hover:shadow-md transition-all"
+                  >
+                    <div className="text-2xl leading-none">+</div>
+                    <div className="flex-1 text-left">
+                      <div className="text-slate-500 dark:text-slate-400 text-sm">
+                        New chat in {activeProject?.name ?? "Project"}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3 opacity-80"></div>
+                  </button>
+
+                  <div className="mt-8">
+                    <div className="text-sm font-semibold text-slate-900 dark:text-white mb-3">
+                      Old chats
+                    </div>
+
+                    <div className="divide-y divide-slate-200 dark:divide-slate-800 rounded-2xl overflow-hidden border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
+                      {filteredSessions.length === 0 ? (
+                        <div className="p-6 text-slate-500 dark:text-slate-400 text-sm">
+                          No chats yet in this project.
+                        </div>
+                      ) : (
+                        filteredSessions.map((s) => (
+                          <button
+                            key={s.id}
+                            onClick={() => handleSelectSession(s.id)}
+                            className="w-full flex items-center justify-between px-5 py-4 text-left hover:bg-slate-50 dark:hover:bg-slate-800/60 transition-colors"
+                          >
+                            <div className="text-sm font-medium text-slate-800 dark:text-slate-100 truncate">
+                              {s.title || "Untitled Session"}
+                            </div>
+                            <div className="text-xs text-slate-400 dark:text-slate-500">
+                              {formatShortDate(s.createdAt)}
+                            </div>
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </div>
               ) : (
-                activeSession.messages.map(msg => (
-                  <MessageBubble
-                    key={msg.id}
-                    message={msg}
-                    highlighted={highlightedMessageId === msg.id}
-                    shouldExpand={areAllExpanded}
-                  />
-                ))
+                <>
+                  {!activeSession ||
+                  activeSession.messages.length === 0 ? (
+                    <div className="flex-1 flex flex-col items-center justify-center text-center space-y-8 animate-in fade-in zoom-in duration-700">
+                      <div className="relative">
+                        <div className="absolute inset-0 bg-indigo-500 blur-3xl opacity-10 rounded-full animate-pulse"></div>
+                        <div className="w-20 h-20 bg-gradient-to-br from-indigo-500 to-emerald-500 rounded-2xl flex items-center justify-center shadow-2xl transform rotate-12">
+                          <span className="text-3xl font-bold text-white serif italic">
+                            D
+                          </span>
+                        </div>
+                      </div>
+                      <div className="max-w-md px-6">
+                        <h2 className="text-2xl font-bold text-slate-900 dark:text-white serif mb-3 italic">
+                          Welcome to the Arena of Wisdom
+                        </h2>
+                        <p className="text-slate-600 dark:text-slate-400 leading-relaxed text-sm">
+                          I am Drona, your master AI mentor. Start a conversation or hit the icon to begin your real-time <b>Interaction Mode</b> session.
+                        </p>
+                      </div>
+                    </div>
+                  ) : (
+                    activeSession.messages.map(msg => (
+                      <MessageBubble
+                        key={msg.id}
+                        message={msg}
+                        highlighted={highlightedMessageId === msg.id}
+                        shouldExpand={areAllExpanded}
+                      />
+                    ))
+                  )}
+                </>
               )}
             </div>
           </main>
 
-          <InputBar
-            onSend={handleSend}
-            onVoiceClick={startInteractionMode}
-            isVoiceActive={isInteractionMode}
-            disabled={isLoading || isInteractionStreaming}
-          />
+          {activeProjectId && activeSessionId && activeSession && (
+            <InputBar
+              onSend={handleSend}
+              onVoiceClick={startInteractionMode}
+              isVoiceActive={isInteractionMode}
+              disabled={isLoading || isInteractionStreaming}
+            />
+          )}
         </div>
 
         <PricingModal

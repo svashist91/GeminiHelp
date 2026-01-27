@@ -220,7 +220,12 @@ export const useContextRecorder = ({ isActive, videoRef, sessionId, userId, getT
                 console.log(`[Recorder] 📝 Audit row created: ${auditRow.id}`);
                 
                 // --- TRIGGER AI ANALYSIS ---
-                console.log('[Recorder] 🧠 Calling analyze-screenshot...');
+                console.log("[Recorder] 🧠 Sending to analyze-screenshot:", {
+                    record_id: auditRow.id,
+                    image_path: data.path,
+                    tokenPreview: token.slice(0, 25) + "...",
+                  });
+                  
                 try {
                   const response = await fetch(`${supabaseUrl}/functions/v1/analyze-screenshot`, {
                     method: 'POST',
@@ -234,9 +239,11 @@ export const useContextRecorder = ({ isActive, videoRef, sessionId, userId, getT
                     })
                   });
 
+                  const aiText = await response.text();
+                  console.log("[Recorder] 🧠 Edge Function raw response:", response.status, aiText);
+
                   if (!response.ok) {
-                    const errorText = await response.text();
-                    console.error('[Recorder] 🧠 Screenshot analysis failed:', response.status, errorText);
+                    console.error('[Recorder] 🧠 Screenshot analysis failed:', response.status, aiText);
                   } else {
                     console.log('[Recorder] 🧠 Screenshot analyzed');
                   }

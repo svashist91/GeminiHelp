@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import crypto from 'node:crypto';
 import path from 'path';
 import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -8,10 +9,11 @@ import cors from 'cors';
 import http from 'http';
 import fs from 'fs';
 import multer, { FileFilterCallback } from 'multer';
-import { DRONA_SYSTEM_PROMPT, DRONA_INTERACTION_PROMPT } from '../src/prompts/drona';
+import { DRONA_SYSTEM_PROMPT, DRONA_INTERACTION_PROMPT, DRONA_PLANNING_PROMPT } from '../src/prompts/drona';
 import Stripe from 'stripe';
 import { extractDocxText } from './extractors/docx';
 import { createClerkClient, verifyToken } from '@clerk/backend';
+import { applyPatch } from '../shared/contextSchema';
 
 // Always load server/.env (backend-only secrets)
 dotenv.config({ path: path.resolve(__dirname, ".env") });
@@ -20,8 +22,6 @@ console.log("[env] CLERK_SECRET_KEY set?", !!process.env.CLERK_SECRET_KEY);
 console.log("[env] SUPABASE_URL set?", !!process.env.SUPABASE_URL);
 console.log("[env] SUPABASE_SERVICE_ROLE_KEY set?", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
 console.log("[env] GOOGLE_API_KEY set?", !!process.env.GOOGLE_API_KEY);
-
-
 
 // Safe pdf-parse import for CommonJS/ESM interop
 const pdfParseModule = require("pdf-parse");
@@ -43,7 +43,7 @@ const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY;
 
-if (!SUPABASE_URL || !SUPABASE_KEY || !GEMINI_KEY) {
+if (!SUPABASE_URL || !SUPABASE_KEY || !GEMINI_KEY || !CLERK_SECRET_KEY) {
   console.error("❌ CRITICAL ERROR: Missing API Keys.");
   process.exit(1);
 }
@@ -67,6 +67,20 @@ const stripe = new Stripe(STRIPE_SECRET_KEY || '', { apiVersion: '2025-12-15.clo
 const TEMP_UPLOAD_DIR = path.resolve(__dirname, '.tmp_uploads');
 const TTL_MINUTES = 30;
 const CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+
+function isPlanningPrompt(text: string): boolean {
+  return /(steps|how to|plan|deploy|architecture|roadmap|build|design|implement|setup|launch)/i.test(text);
+}
+
+function pickInitialMaxTokens(prompt: string): number {
+  if (isPlanningPrompt(prompt)) return 2048;
+  if (prompt.length > 250) return 1536;
+  return 1024;
+}
+
+function nextRoundMaxTokens(current: number): number {
+  return Math.min(current * 2, 4096);
+}
 
 // Ensure temp directory exists
 if (!fs.existsSync(TEMP_UPLOAD_DIR)) {
@@ -604,7 +618,7 @@ app.post('/api/chat', async (req, res) => {
   const filesToDelete: string[] = [];
 
   try {
-    const { message, history } = req.body;
+    const { message, history, projectId, sessionId } = req.body;
 
     if (typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({ error: 'Invalid or empty message' });
@@ -641,29 +655,126 @@ app.post('/api/chat', async (req, res) => {
       { role: 'user', parts: userParts }
     ];
     
-    // Use models.generateContentStream instead of chats.create().sendMessageStream()
-    const result = await client.models.generateContentStream({
-      model: CHAT_MODEL,
-      config: {
-        systemInstruction: DRONA_SYSTEM_PROMPT,
-        temperature: 0.4,
-        maxOutputTokens: 600
-      },
-      contents
-    });
-    
     // Set proper streaming headers
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
-    
-    for await (const chunk of result) {
-      const chunkText = chunk.text; 
-      if (chunkText) {
-        res.write(chunkText);
+    res.flushHeaders?.();
+
+    const promptText = message.trim();
+    const systemInstruction =
+      isPlanningPrompt(promptText)
+        ? `${DRONA_SYSTEM_PROMPT}\n\n${DRONA_PLANNING_PROMPT}`
+        : DRONA_SYSTEM_PROMPT;
+    const baseContents = [
+      ...compactedHistory,
+      { role: 'user', parts: userParts }
+    ];
+
+    if (isPlanningPrompt(promptText)) {
+      baseContents.push({
+        role: "user",
+        parts: [{
+          text:
+            "Give a COMPLETE end-to-end plan as a numbered list (8–12 steps). " +
+            "You MUST cover: discovery, content strategy, app architecture, data/storage, UX/UI, " +
+            "implementation, testing/QA, deployment, app store release, monitoring/analytics, and iteration. " +
+            "Keep the introduction to 1 sentence maximum. " +
+            "Do not stop early. Do not ask follow-up questions."
+        }]
+      });
+    }
+
+    const MAX_ROUNDS = 3;
+    const MAX_TOTAL_OUTPUT_TOKENS = 8192;
+    let round = 0;
+    let maxOutputTokens = pickInitialMaxTokens(promptText);
+    let totalOutputTokenBudget = 0;
+    let lastFinishReason: string | undefined;
+    let totalChars = 0;
+    let wroteAny = false;
+    let assistantSoFar = "";
+
+    try {
+      while (round < MAX_ROUNDS) {
+        round += 1;
+        lastFinishReason = undefined;
+        totalOutputTokenBudget += maxOutputTokens;
+        if (totalOutputTokenBudget > MAX_TOTAL_OUTPUT_TOKENS) {
+          break;
+        }
+
+        const modelSoFar =
+          round > 1
+            ? [{ role: 'model', parts: [{ text: assistantSoFar.slice(-4000) }] }]
+            : [];
+
+        const continuation =
+          round > 1
+            ? [{ role: 'user', parts: [{ text: 'Continue exactly from where you left off. Do not repeat. Finish the answer.' }] }]
+            : [];
+
+        const contentsForRound = [...baseContents, ...modelSoFar, ...continuation];
+
+        try {
+          const result = await client.models.generateContentStream({
+            model: CHAT_MODEL,
+            config: {
+              systemInstruction,
+              temperature: 0.4,
+              maxOutputTokens
+            },
+            contents: contentsForRound
+          });
+
+          let roundAssistant = "";
+
+          for await (const chunk of result) {
+            const finishReason = chunk?.candidates?.[0]?.finishReason;
+            if (finishReason) lastFinishReason = finishReason;
+            const chunkText = chunk.text;
+            if (chunkText) {
+              roundAssistant += chunkText;
+              assistantSoFar += chunkText;
+              totalChars += chunkText.length;
+              wroteAny = true;
+              res.write(chunkText);
+            }
+          }
+
+          console.log(`[chat] round=${round} finishReason=${lastFinishReason} chars=${totalChars}`);
+
+        } catch (streamError: any) {
+          console.error("🔥 Chat stream error:", streamError);
+          if (!wroteAny) {
+            res.write("Sorry, something went wrong. Please try again.");
+          }
+          break;
+        }
+
+        if (lastFinishReason !== 'MAX_TOKENS') {
+          break;
+        }
+
+        maxOutputTokens = nextRoundMaxTokens(maxOutputTokens);
+      }
+
+      if (lastFinishReason === 'MAX_TOKENS') {
+        res.write('\n\n(Truncated — ask me to continue.)');
+      }
+
+      console.log(
+        `[chat] rounds=${round} finishReason=${lastFinishReason} totalChars=${totalChars} promptChars=${promptText.length}`,
+        'project:',
+        projectId ?? 'n/a',
+        'session:',
+        sessionId ?? 'n/a'
+      );
+    } finally {
+      if (!res.writableEnded) {
+        res.end();
       }
     }
-    res.end();
 
   } catch (error: any) {
     console.error("🔥 Chat API Error:", error);
@@ -709,9 +820,30 @@ app.get('/api/sessions', async (req, res) => {
 });
 
 app.post('/api/sessions', async (req, res) => {
-  const { id, userId, title, createdAt } = req.body;
-  await supabase.from('sessions').upsert({ id, user_id: userId, title, created_at: createdAt });
-  res.json({ success: true });
+  const { id, userId, title, createdAt, projectId } = req.body;
+
+  console.log('[api/sessions] body:', req.body);
+  console.log('[api/sessions] projectId typeof:', typeof projectId, 'value:', projectId);
+
+  const { data, error } = await supabase
+    .from('sessions')
+    .upsert({
+      id,
+      user_id: userId,
+      title,
+      created_at: createdAt,
+      project_id: projectId ?? null
+    })
+    .select('id, project_id, user_id, title, created_at')
+    .single();
+
+  if (error) {
+    console.error('[api/sessions] upsert error:', error);
+    return res.status(500).json({ error });
+  }
+
+  console.log('[api/sessions] saved row:', data);
+  return res.json({ success: true, session: data });
 });
 
 app.post('/api/messages', async (req, res) => {
@@ -721,8 +853,62 @@ app.post('/api/messages', async (req, res) => {
 });
 
 app.delete('/api/sessions/:id', async (req, res) => {
-  await supabase.from('sessions').delete().eq('id', req.params.id);
-  res.json({ success: true });
+  const sessionId = req.params.id;
+  try {
+    const { error: msgErr } = await supabase
+      .from('messages')
+      .delete()
+      .eq('session_id', sessionId);
+    if (msgErr) throw msgErr;
+
+    const { error: sessErr } = await supabase
+      .from('sessions')
+      .delete()
+      .eq('id', sessionId);
+    if (sessErr) throw sessErr;
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[api/sessions] delete error:', error);
+    res.status(500).json({ error });
+  }
+});
+
+app.delete('/api/projects/:id', async (req, res) => {
+  const projectId = req.params.id;
+  try {
+    const { data: sessions, error: sessionsErr } = await supabase
+      .from('sessions')
+      .select('id')
+      .eq('project_id', projectId);
+    if (sessionsErr) throw sessionsErr;
+
+    const sessionIds = (sessions ?? []).map(s => s.id);
+    if (sessionIds.length > 0) {
+      const { error: msgErr } = await supabase
+        .from('messages')
+        .delete()
+        .in('session_id', sessionIds);
+      if (msgErr) throw msgErr;
+    }
+
+    const { error: sessErr } = await supabase
+      .from('sessions')
+      .delete()
+      .eq('project_id', projectId);
+    if (sessErr) throw sessErr;
+
+    const { error: projErr } = await supabase
+      .from('projects')
+      .delete()
+      .eq('id', projectId);
+    if (projErr) throw projErr;
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[api/projects] delete error:', error);
+    res.status(500).json({ error });
+  }
 });
 
 // --- SEARCH ROUTE ---
@@ -857,6 +1043,214 @@ app.get('/api/chat/search', async (req, res) => {
   } catch (error: any) {
     console.error('[search] Unexpected error:', error);
     res.status(500).json({ error: 'Internal server error', details: error.message });
+  }
+});
+
+// GET /api/projects/:projectId/context
+app.get('/api/projects/:projectId/context', async (req, res) => {
+  try {
+    // Authenticate Clerk user
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Missing or invalid authorization header' });
+    }
+
+    const token = authHeader.replace('Bearer ', '');
+    let userId: string;
+
+    try {
+      const { sub } = await verifyToken(token, { secretKey: CLERK_SECRET_KEY });
+      if (!sub) {
+        return res.status(401).json({ error: 'Invalid token: missing user ID' });
+      }
+      userId = sub;
+    } catch (authError: any) {
+      console.error('[project-context] Clerk auth error:', authError.message);
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    const projectId = req.params.projectId;
+
+    const { data: project, error: projectError } = await supabase
+      .from('projects')
+      .select('id, user_id')
+      .eq('id', projectId)
+      .eq('user_id', userId)
+      .single();
+
+    if (projectError || !project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    const { data: contextRow, error: contextError } = await supabase
+      .from('project_context')
+      .select('project_id, context_json, version, created_at, updated_at')
+      .eq('project_id', projectId)
+      .single();
+
+    if (contextError || !contextRow) {
+      console.error("[project-context] contextError:", contextError);
+      return res.status(404).json({ error: 'project_context not found for this project' });
+    }
+
+    console.log('[project-context] ok', projectId);
+    return res.json({
+      ok: true,
+      project_id: contextRow.project_id,
+      context_json: contextRow.context_json,
+      context_version: contextRow.version,
+      updated_at: contextRow.updated_at
+    });
+  } catch (error) {
+    console.error('[project-context] error:', error);
+    return res.status(500).json({ error: 'Failed to fetch project context' });
+  }
+});
+
+// POST /api/projects/:projectId/context/apply
+app.post('/api/projects/:projectId/context/apply', async (req, res) => {
+  const reqId = crypto.randomUUID();
+  const projectId = req.params.projectId;
+  const authHeader = req.headers.authorization;
+  const baseVersionRaw = req.body?.base_version;
+  const patch = req.body?.patch;
+
+  console.groupCollapsed(`[context-apply][${reqId}] start`);
+  console.log('projectId', projectId);
+  console.log('hasAuthHeader', !!authHeader);
+  console.log('content-type', req.headers['content-type']);
+  console.log('base_version raw', baseVersionRaw);
+  console.log('patch_id', patch?.patch_id);
+  console.log('ops.length', Array.isArray(patch?.ops) ? patch.ops.length : 0);
+  console.log('ops', Array.isArray(patch?.ops) ? patch.ops.map((op: any) => op?.op) : []);
+  try {
+    // Authenticate Clerk user
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Missing or invalid authorization header' });
+    }
+
+    const token = authHeader.replace('Bearer ', '');
+    let userId: string;
+
+    try {
+      const { sub } = await verifyToken(token, { secretKey: CLERK_SECRET_KEY });
+      if (!sub) {
+        return res.status(401).json({ error: 'Invalid token: missing user ID' });
+      }
+      userId = sub;
+      console.log('userId', userId);
+    } catch (authError: any) {
+      console.error('[context-apply] Clerk auth error:', authError.message);
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    const { data: project, error: projectError } = await supabase
+      .from('projects')
+      .select('id, user_id')
+      .eq('id', projectId)
+      .eq('user_id', userId)
+      .single();
+
+    if (projectError || !project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+    console.log('project found', project.id);
+
+    const baseVersion = Number(baseVersionRaw);
+    const hasValidBaseVersion = Number.isFinite(baseVersion);
+    const hasValidPatchId = typeof patch?.patch_id === 'string' && patch.patch_id.trim().length > 0;
+    const hasValidOps = Array.isArray(patch?.ops);
+
+    if (!hasValidBaseVersion || !hasValidPatchId || !hasValidOps) {
+      return res.status(400).json({ ok: false, error: 'invalid_request' });
+    }
+
+    const { data: contextRow, error: contextError } = await supabase
+      .from('project_context')
+      .select('project_id, context_json, version, updated_at')
+      .eq('project_id', projectId)
+      .single();
+
+    if (contextError || !contextRow) {
+      return res.status(404).json({ error: 'project_context not found for this project' });
+    }
+    console.log('currentVersion', contextRow.version);
+
+    if (contextRow.version !== baseVersion) {
+      console.log('version mismatch', {
+        currentVersion: contextRow.version,
+        baseVersion
+      });
+      return res.status(409).json({
+        ok: false,
+        error: 'version_conflict',
+        current_version: contextRow.version,
+        context_json: contextRow.context_json,
+        updated_at: contextRow.updated_at
+      });
+    }
+
+    let nextContext: any;
+    try {
+      console.log('applying patch...');
+      nextContext = applyPatch(contextRow.context_json, patch);
+      console.log('applyPatch OK', { nextVersion: nextContext?.version });
+    } catch (err: any) {
+      console.error('applyPatch failed', err?.stack || err);
+      console.error('patch.ops', patch?.ops);
+      return res.status(400).json({ ok: false, error: 'invalid_patch', message: err?.message || String(err) });
+    }
+
+    const nextVersion = contextRow.version + 1;
+    const newUpdatedAt = new Date().toISOString();
+    const { data: updatedRows, error: updateError } = await supabase
+      .from('project_context')
+      .update({
+        context_json: nextContext,
+        version: nextVersion,
+        updated_at: newUpdatedAt
+      })
+      .eq('project_id', projectId)
+      .eq('version', baseVersion)
+      .select('updated_at');
+
+    console.log('update result', {
+      updateError,
+      updatedRows: updatedRows?.length ?? 0
+    });
+    if (updateError) {
+      return res.status(500).json({ error: 'Failed to update project context' });
+    }
+    if (!updatedRows || updatedRows.length === 0) {
+      console.log('0 rows updated → conflict or RLS');
+      const { data: latestRow } = await supabase
+        .from('project_context')
+        .select('context_json, version, updated_at')
+        .eq('project_id', projectId)
+        .single();
+      return res.status(409).json({
+        ok: false,
+        error: 'version_conflict',
+        current_version: latestRow?.version,
+        context_json: latestRow?.context_json,
+        updated_at: latestRow?.updated_at
+      });
+    }
+
+    const updatedAt = updatedRows?.[0]?.updated_at ?? newUpdatedAt;
+    console.log(`[context-apply] projectId=${projectId} newVersion=${nextVersion}`);
+    return res.status(200).json({
+      ok: true,
+      project_id: projectId,
+      new_version: nextVersion,
+      context_json: nextContext,
+      updated_at: updatedAt
+    });
+  } catch (error) {
+    console.error('[context-apply] error:', error);
+    return res.status(500).json({ error: 'Failed to apply project context patch' });
+  } finally {
+    console.groupEnd();
   }
 });
 

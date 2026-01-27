@@ -26,4 +26,5 @@ export interface ChatSession {
   title: string;
   messages: Message[];
   createdAt: Date;
+  project_id?: string | null;
 }
