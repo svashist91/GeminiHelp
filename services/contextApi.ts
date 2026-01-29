@@ -149,4 +149,100 @@ import {
     console.groupEnd();
   }
   }
+
+type GetContextSuccess = {
+  ok: true;
+  context: PlanContext;
+};
+
+type GetContextError = {
+  ok: false;
+  error: 'unauthorized' | 'invalid_request' | 'server_error';
+  message?: string;
+  status?: number;
+};
+
+export async function getProjectContext(args: {
+  projectId: string;
+  apiBaseUrl?: string; // defaults to http://localhost:3001
+  getToken?: () => Promise<string | null>;
+}): Promise<GetContextSuccess | GetContextError> {
+  const {
+    projectId,
+    apiBaseUrl = 'http://localhost:3001',
+    getToken
+  } = args;
+
+  const fallbackGetToken = async (): Promise<string | null> => {
+    const clerk = (window as any).Clerk;
+    if (clerk?.session?.getToken) {
+      return await clerk.session.getToken();
+    }
+    return null;
+  };
+
+  console.groupCollapsed('[contextApi] getProjectContext');
+  const requestUrl = `${apiBaseUrl}/api/projects/${projectId}/context`;
+
+  try {
+    const token = await (getToken ? getToken() : fallbackGetToken());
+    console.log('auth', { token: token ? token.slice(0, 10) : null });
+    console.log('url', requestUrl);
+
+    if (!token) {
+      return { ok: false, error: 'unauthorized', message: 'Missing auth token' };
+    }
+
+    const res = await fetch(requestUrl, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    });
+
+    const responseText = await res.text();
+    console.log('response', { status: res.status, responseText });
+
+    let data: any = null;
+    try {
+      data = JSON.parse(responseText);
+      console.log('responseJson', data);
+    } catch (parseError) {
+      console.error('responseJson parse error', parseError);
+    }
+
+    const safeContext = (raw: any): PlanContext => {
+      try {
+        return validatePlanContext(raw);
+      } catch {
+        return createEmptyPlanContext();
+      }
+    };
+
+    if (res.status === 401) {
+      return { ok: false, error: 'unauthorized', message: responseText, status: res.status };
+    }
+
+    if (!res.ok) {
+      const error: GetContextError['error'] =
+        res.status === 400 || data?.error === 'invalid_request'
+          ? 'invalid_request'
+          : 'server_error';
+      return { ok: false, error, message: responseText, status: res.status };
+    }
+
+    const raw = data?.context_json ?? data?.context ?? data;
+    const context = safeContext(raw);
+    return { ok: true, context };
+  } catch (error: any) {
+    console.error('getProjectContext error', error?.stack || error);
+    return {
+      ok: false,
+      error: 'server_error',
+      message: error?.message || String(error)
+    };
+  } finally {
+    console.groupEnd();
+  }
+}
   
